@@ -1,24 +1,29 @@
 <?php
-// Configurações do banco de dados
-define('DB_HOST', 'localhost');
-define('DB_NAME', 'nupics_db');
-define('DB_USER', 'root');   // usuário padrão do XAMPP
-define('DB_PASS', '');       // senha em branco no XAMPP local
+// Railway injeta automaticamente as variáveis de ambiente
+// Localmente cai nos valores padrão do XAMPP
+$host     = getenv('MYSQLHOST')     ?: 'localhost';
+$porta    = getenv('MYSQLPORT')     ?: '3306';
+$banco    = getenv('MYSQLDATABASE') ?: 'nupics_db';
+$usuario  = getenv('MYSQLUSER')     ?: 'root';
+$senha    = getenv('MYSQLPASSWORD') ?: '';
 
 try {
     $pdo = new PDO(
-        'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8',
-        DB_USER,
-        DB_PASS
+        "mysql:host={$host};port={$porta};dbname={$banco};charset=utf8mb4",
+        $usuario,
+        $senha,
+        [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ]
     );
-
-    // Faz o PHP mostrar erros do banco durante o desenvolvimento
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
-    // Retorna os resultados como array associativo (ex: $row['nome'])
-    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
 } catch (PDOException $e) {
-    // Se não conseguir conectar, mostra a mensagem de erro
-    die('Erro ao conectar com o banco de dados: ' . $e->getMessage());
+    // Em produção não exibe detalhes do erro
+    $ambiente = getenv('RAILWAY_ENVIRONMENT') ? 'production' : 'local';
+    if ($ambiente === 'local') {
+        die('Erro de conexão: ' . $e->getMessage());
+    } else {
+        die('Erro de conexão com o banco de dados. Contate o administrador.');
+    }
 }
