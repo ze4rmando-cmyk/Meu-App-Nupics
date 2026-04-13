@@ -157,6 +157,7 @@ $playlists = !empty($playlists_db) ? $playlists_db : [['emoji'=>'🌿','nome'=>'
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NUPICS — Portal do Paciente</title>
@@ -174,6 +175,8 @@ $playlists = !empty($playlists_db) ? $playlists_db : [['emoji'=>'🌿','nome'=>'
     }
   </script>
   <style>
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+.scrollbar-hide { scrollbar-width: none; }
     body { font-family:'Manrope',sans-serif; background:radial-gradient(circle at top left,#f7eaf8,#fff7fc); }
     h1,h2,h3,.headline { font-family:'Plus Jakarta Sans',sans-serif; }
     .material-symbols-outlined { font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24; }

@@ -203,6 +203,7 @@ if (isset($_POST['horario_id']) && isset($_POST['data_escolhida'])) {
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NUPICS — Agendar Sessão</title>

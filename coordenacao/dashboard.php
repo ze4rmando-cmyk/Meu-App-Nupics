@@ -112,6 +112,7 @@ $frase_hoje = !empty($frases_terapeuta) ? $frases_terapeuta[date('z')%count($fra
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NUPICS — Gestão</title>
@@ -122,6 +123,8 @@ $frase_hoje = !empty($frases_terapeuta) ? $frases_terapeuta[date('z')%count($fra
     tailwind.config={theme:{extend:{fontFamily:{headline:['Plus Jakarta Sans'],body:['Manrope']},colors:{primary:'#4e0078',secondary:'#b7004d'}}}}
   </script>
   <style>
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+.scrollbar-hide { scrollbar-width: none; }
     body{font-family:'Manrope',sans-serif;background:#fff7fc;}
     h1,h2,h3{font-family:'Plus Jakarta Sans',sans-serif;}
     .material-symbols-outlined{font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24;}

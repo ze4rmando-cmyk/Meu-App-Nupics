@@ -169,6 +169,7 @@ $horas_grade = ['07:00','09:00','11:00','14:00','16:00'];
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NUPICS Caicó — Cronograma</title>
