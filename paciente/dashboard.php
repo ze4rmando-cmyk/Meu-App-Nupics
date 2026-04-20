@@ -1,882 +1,968 @@
 <?php
 session_start();
+if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'paciente') {
+    header('Location: ../index.php'); exit;
+}
 require_once '../config/db.php';
 
-if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'paciente') {
-    header('Location: ../index.php');
-    exit;
-}
+$uid          = (int)$_SESSION['usuario_id'];
+$nome         = $_SESSION['nome'];
+$primeiro     = explode(' ', trim($nome))[0];
 
-// ── Processa faltas automáticas ──
-$pdo->query('
-    UPDATE agendamentos
-    SET status = "faltou"
-    WHERE status = "agendado"
-      AND data < CURDATE()
-      AND justificativa IS NULL
-');
-$ciclos_faltas = $pdo->query('
-    SELECT c.id, c.paciente_id,
-           COUNT(CASE WHEN a.status = "faltou" AND a.justificativa IS NULL THEN 1 END) AS faltas_inj
-    FROM ciclos c
-    JOIN agendamentos a ON a.ciclo_id = c.id
-    WHERE c.status = "ativo"
-    GROUP BY c.id
-    HAVING faltas_inj >= 2
-')->fetchAll();
-foreach ($ciclos_faltas as $cf) {
-    $pdo->prepare('UPDATE ciclos SET status = "cancelado" WHERE id = ?')->execute([$cf['id']]);
-    $pdo->prepare('UPDATE agendamentos SET status = "cancelado" WHERE ciclo_id = ? AND status = "agendado" AND data >= CURDATE()')->execute([$cf['id']]);
-}
+// ── Dados do paciente ────────────────────────────────────────────────────────
+$pac = $pdo->prepare("
+    SELECT p.*, u.telefone, u.email
+    FROM pacientes p JOIN usuarios u ON p.usuario_id = u.id
+    WHERE p.usuario_id = ?
+");
+$pac->execute([$uid]); $paciente = $pac->fetch(PDO::FETCH_ASSOC);
 
-$uid = (int)$_SESSION['usuario_id'];
-$stmt = $pdo->prepare('
-    SELECT p.id AS paciente_id, u.nome, u.email, u.telefone
-    FROM pacientes p JOIN usuarios u ON u.id = p.usuario_id
-    WHERE u.id = ?
-');
-$stmt->execute([$uid]);
-$paciente    = $stmt->fetch();
-$paciente_id = $paciente['paciente_id'];
-$primeiro    = explode(' ', $paciente['nome'])[0];
+$bem_estar = null;
+if ($paciente && preg_match('/Bem-estar atual: (\d+)\/10/', $paciente['observacao_clinica'] ?? '', $m))
+    $bem_estar = (int)$m[1];
 
-$sucesso = '';
-$erro    = '';
-
-// ── Justificar falta ──
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['acao'] ?? '') === 'justificar_falta') {
-    $agend_id      = (int)$_POST['agendamento_id'];
-    $justificativa = trim($_POST['justificativa'] ?? '');
-
-    if (!$justificativa) {
-        $erro = 'Escreva o motivo da justificativa.';
-    } else {
-        $chk = $pdo->prepare('
-            SELECT COUNT(*) FROM agendamentos
-            WHERE ciclo_id = (SELECT ciclo_id FROM agendamentos WHERE id = ?)
-              AND justificativa IS NOT NULL
-        ');
-        $chk->execute([$agend_id]);
-        if ($chk->fetchColumn() >= 1) {
-            $erro = 'Você já usou sua única justificativa permitida neste ciclo.';
-        } else {
-            $pdo->prepare('
-                UPDATE agendamentos
-                SET justificativa = ?, justificativa_em = NOW()
-                WHERE id = ? AND status = "agendado"
-            ')->execute([$justificativa, $agend_id]);
-            $sucesso = 'Justificativa registrada com sucesso.';
-        }
-    }
-}
-
-// ── Próximo agendamento ──
-$stmt = $pdo->prepare('
-    SELECT a.id, a.data, a.status, a.numero_sessao, a.justificativa,
-           h.hora_inicio, h.duracao_minutos,
-           u.nome AS terapeuta_nome, t.especialidade,
-           c.total_sessoes, c.id AS ciclo_id
-    FROM agendamentos a
-    JOIN horarios h ON h.id = a.horario_id
-    JOIN ciclos c ON c.id = a.ciclo_id
-    LEFT JOIN terapeutas t ON t.id = a.terapeuta_id
-    LEFT JOIN usuarios u ON u.id = t.usuario_id
-    WHERE c.paciente_id = ? AND a.data >= CURDATE() AND a.status = "agendado"
-    ORDER BY a.data, h.hora_inicio LIMIT 1
-');
-$stmt->execute([$paciente_id]);
-$proximo = $stmt->fetch();
-
-// ── Histórico de sessões ──
-$stmt = $pdo->prepare('
-    SELECT a.id, a.data, a.status, a.numero_sessao, a.justificativa,
-           h.hora_inicio, h.duracao_minutos,
-           u.nome AS terapeuta_nome, t.especialidade,
-           c.total_sessoes, c.id AS ciclo_id
-    FROM agendamentos a
-    JOIN horarios h ON h.id = a.horario_id
-    JOIN ciclos c ON c.id = a.ciclo_id
-    LEFT JOIN terapeutas t ON t.id = a.terapeuta_id
-    LEFT JOIN usuarios u ON u.id = t.usuario_id
-    WHERE c.paciente_id = ?
-    ORDER BY a.data DESC, h.hora_inicio DESC
-    LIMIT 20
-');
-$stmt->execute([$paciente_id]);
-$historico = $stmt->fetchAll();
-
-// ── Ciclo ativo ──
-$stmt = $pdo->prepare('
-    SELECT c.id, c.total_sessoes,
-           COUNT(CASE WHEN a.status = "realizado" THEN 1 END) AS feitas,
-           COUNT(CASE WHEN a.status = "faltou" AND a.justificativa IS NULL THEN 1 END) AS faltas_inj,
+// ── Reservas ─────────────────────────────────────────────────────────────────
+$res = $pdo->prepare("
+    SELECT r.id, r.status, r.data_sessao, r.queixas,
+           r.telefone_contato, r.observacao, r.criado_em,
+           s.hora_inicio, s.hora_fim, s.local, s.praticas, s.dia_semana,
            u.nome AS terapeuta_nome, t.especialidade
-    FROM ciclos c
-    JOIN terapeutas t ON t.id = c.terapeuta_id
-    JOIN usuarios u ON u.id = t.usuario_id
-    LEFT JOIN agendamentos a ON a.ciclo_id = c.id
-    WHERE c.paciente_id = ? AND c.status = "ativo"
-    GROUP BY c.id LIMIT 1
-');
-$stmt->execute([$paciente_id]);
-$ciclo = $stmt->fetch();
+    FROM reservas r
+    JOIN slots s    ON r.slot_id      = s.id
+    JOIN usuarios u ON s.terapeuta_id = u.id
+    LEFT JOIN terapeutas t ON t.usuario_id = u.id
+    WHERE r.paciente_id = ?
+    ORDER BY r.data_sessao DESC, s.hora_inicio DESC
+");
+$res->execute([$uid]); $reservas = $res->fetchAll(PDO::FETCH_ASSOC);
 
-// ── Terapeutas ──
-$terapeutas = $pdo->query('
-    SELECT t.id, u.nome, t.especialidade,
-           COUNT(DISTINCT h.id) AS vagas
-    FROM terapeutas t
-    JOIN usuarios u ON u.id = t.usuario_id
-    JOIN horario_terapeutas ht ON ht.terapeuta_id = t.id
-    JOIN horarios h ON h.id = ht.horario_id AND h.ativo = 1
-    WHERE t.ativo = 1
-    GROUP BY t.id, u.nome, t.especialidade
-')->fetchAll();
+$total      = count($reservas);
+$pendentes  = count(array_filter($reservas, fn($r) => $r['status'] === 'pendente'));
+$proximas   = count(array_filter($reservas, fn($r) => $r['status'] === 'confirmado' && $r['data_sessao'] >= date('Y-m-d')));
+$concluidas = count(array_filter($reservas, fn($r) => $r['status'] === 'concluido'));
 
-// ── Frases do banco ou fallback ──
-try {
-    $frases_db = $pdo->query('SELECT texto FROM frases WHERE tipo="paciente" AND ativo=1 ORDER BY id')->fetchAll(PDO::FETCH_COLUMN);
-    $frases = !empty($frases_db) ? $frases_db : ['"Cuidar de você também é prioridade. Respire fundo."'];
-} catch (Exception $e) {
-    $frases = ['"Cuidar de você também é prioridade. Respire fundo."'];
-}
-$frase = $frases[date('z') % count($frases)];
-
-// ── Playlists do banco ou fallback ──
-try {
-    $playlists_db = $pdo->query('SELECT emoji, nome, url FROM playlists WHERE ativo=1 ORDER BY ordem')->fetchAll();
-    $playlists = !empty($playlists_db) ? $playlists_db : [
-        ['emoji'=>'🌿','nome'=>'Sons da natureza','url'=>'https://www.youtube.com/watch?v=1ZYbU82GVz4'],
-    ];
-} catch (Exception $e) {
-    $playlists = [
-        ['emoji'=>'🌿','nome'=>'Sons da natureza','url'=>'https://www.youtube.com/watch?v=1ZYbU82GVz4'],
-        ['emoji'=>'🌊','nome'=>'Ruído branco','url'=>'https://www.youtube.com/watch?v=nMfPqeZjc2c'],
-        ['emoji'=>'🎹','nome'=>'Piano suave','url'=>'https://www.youtube.com/watch?v=jfKfPfyJRdk'],
-        ['emoji'=>'🎻','nome'=>'Instrumental','url'=>'https://www.youtube.com/watch?v=7NOSDKb0HlU'],
-        ['emoji'=>'🎵','nome'=>'MPB leve','url'=>'https://www.youtube.com/watch?v=dDo3IHiXMeI'],
-    ];
+$proxima = null;
+foreach ($reservas as $r) {
+    if ($r['status'] === 'confirmado' && $r['data_sessao'] >= date('Y-m-d')) { $proxima = $r; break; }
 }
 
-$meses_pt = ['','Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+// ── Fila de espera ────────────────────────────────────────────────────────────
+$filas = $pdo->prepare("
+    SELECT fe.posicao, fe.data_sessao, fe.status,
+           s.hora_inicio, s.hora_fim, s.dia_semana, s.local,
+           u.nome AS terapeuta_nome
+    FROM fila_espera fe
+    JOIN slots s    ON fe.slot_id     = s.id
+    JOIN usuarios u ON s.terapeuta_id = u.id
+    WHERE fe.paciente_id = ? AND fe.status IN ('aguardando','notificado')
+    ORDER BY fe.criado_em ASC
+");
+$filas->execute([$uid]); $filas = $filas->fetchAll(PDO::FETCH_ASSOC);
 
-// ── Práticas ──
-$praticas = [
-    ['id'=>'respiracao','titulo'=>'Respiração Guiada','duracao'=>'5 min · Suave',
-     'badge'=>['cor'=>'bg-pink-700/80','txt'=>'Recomendado'],
-     'desc'=>'Acalme a mente ansiosa e reequilibre o corpo em poucos minutos.',
-     'img'=>'https://images.unsplash.com/photo-1506126613408-eca07ce68773?w=400&q=80',
-     'musica'=>['nome'=>'Sons da Natureza 🌿','url'=>'https://www.youtube.com/watch?v=1ZYbU82GVz4'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Sente-se confortavelmente. Relaxe os ombros. Se puder, feche os olhos.'],
-       ['icone'=>'🫁','titulo'=>'Condução','texto'=>"Inspire pelo nariz (1…2…3…4)\nSegure um instante…\nExpire pela boca (1…2…3…4…5…6)\nRepita. Apenas observe o ar entrando e saindo."],
-       ['icone'=>'🌿','titulo'=>'Fechamento','texto'=>"Respire fundo mais uma vez… e solte devagar.\n👉 Você pode seguir com seu dia mais leve."],
-     ]],
-    ['id'=>'meditacao','titulo'=>'Meditação Breve','duracao'=>'7 min · Moderada',
-     'badge'=>['cor'=>'bg-purple-700/80','txt'=>'Destaque'],
-     'desc'=>'Foque no agora e liberte-se de preocupações futuras.',
-     'img'=>'https://images.unsplash.com/photo-1508672019048-805c876b67e2?w=400&q=80',
-     'musica'=>['nome'=>'Piano Suave 🎹','url'=>'https://www.youtube.com/watch?v=jfKfPfyJRdk'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Encontre uma posição confortável. Mantenha a coluna levemente ereta.'],
-       ['icone'=>'🧠','titulo'=>'Condução','texto'=>"Traga sua atenção para o momento presente.\nObserve: sua respiração, seu corpo, os sons ao redor.\nSe pensamentos surgirem, deixe passar… como nuvens."],
-       ['icone'=>'🌿','titulo'=>'Fechamento','texto'=>"Leve uma mão ao peito.\nRespire fundo.\n👉 Você tirou um tempo pra você."],
-     ]],
-    ['id'=>'escalda','titulo'=>'Escalda-pés Relaxante','duracao'=>'10–15 min · Suave',
-     'badge'=>['cor'=>'bg-teal-700/80','txt'=>'Ancestral'],
-     'desc'=>'Um ritual ancestral para descarregar tensões e preparar o sono.',
-     'img'=>'https://images.unsplash.com/photo-1544161515-4ab6ce6db874?w=400&q=80',
-     'musica'=>['nome'=>'Ruído Branco 🌊','url'=>'https://www.youtube.com/watch?v=nMfPqeZjc2c'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Prepare um recipiente com água morna. Sente-se confortavelmente.'],
-       ['icone'=>'🌊','titulo'=>'Condução','texto'=>"Coloque os pés na água… devagar.\nSinta a temperatura. Respire fundo.\nImagine o estresse saindo do corpo…"],
-       ['icone'=>'🌿','titulo'=>'Fechamento','texto'=>"Retire os pés lentamente. Seque com calma.\n👉 Perceba o relaxamento no corpo inteiro."],
-     ]],
-    ['id'=>'estresse','titulo'=>'Relaxamento Rápido','duracao'=>'3 min · Rápido',
-     'badge'=>['cor'=>'bg-orange-700/80','txt'=>'Urgente'],
-     'desc'=>'Para momentos de alta pressão. Pause, respire, recentre.',
-     'img'=>'https://images.unsplash.com/photo-1499209974431-9dddcece7f88?w=400&q=80',
-     'musica'=>['nome'=>'Sons da Natureza 🌿','url'=>'https://www.youtube.com/watch?v=1ZYbU82GVz4'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Pare por um momento. Respire fundo.'],
-       ['icone'=>'🧠','titulo'=>'Condução','texto'=>"Pergunte a si mesmo:\n👉 \"O que realmente precisa da minha atenção agora?\"\nDeixe o resto de lado. Solte a tensão do corpo."],
-       ['icone'=>'🌿','titulo'=>'Fechamento','texto'=>"Você não precisa resolver tudo hoje.\nUm passo de cada vez."],
-     ]],
-    ['id'=>'massoterapia','titulo'=>'Preparação para Massoterapia','duracao'=>'5 min · Suave',
-     'badge'=>['cor'=>'bg-indigo-700/80','txt'=>'Pré-sessão'],
-     'desc'=>'Prepare corpo e mente para receber o cuidado integrativo.',
-     'img'=>'https://images.unsplash.com/photo-1600334089648-b0d9d3028eb2?w=400&q=80',
-     'musica'=>['nome'=>'Instrumental 🎻','url'=>'https://www.youtube.com/watch?v=7NOSDKb0HlU'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Antes do atendimento, desacelere. Evite celular ou estímulos intensos.'],
-       ['icone'=>'🫁','titulo'=>'Condução','texto'=>"Respire fundo 3 vezes.\nRelaxe o corpo. Solte os ombros, mandíbula e mãos."],
-       ['icone'=>'🌿','titulo'=>'Orientação','texto'=>"Permita-se receber o cuidado.\n👉 Apenas esteja presente."],
-     ]],
-    ['id'=>'aterramento','titulo'=>'Aterramento (Ansiedade)','duracao'=>'5 min · Suave',
-     'badge'=>['cor'=>'bg-emerald-700/80','txt'=>'Ansiedade'],
-     'desc'=>'Técnica 5-4-3-2-1 para reconectar com o momento presente.',
-     'img'=>'https://images.unsplash.com/photo-1476611338391-6f395a0dd82e?w=400&q=80',
-     'musica'=>['nome'=>'MPB Leve 🎵','url'=>'https://www.youtube.com/watch?v=dDo3IHiXMeI'],
-     'passos'=>[
-       ['icone'=>'🧘','titulo'=>'Início','texto'=>'Olhe ao seu redor. Respire fundo.'],
-       ['icone'=>'🧠','titulo'=>'Condução (5-4-3-2-1)','texto'=>"Identifique:\n• 5 coisas que você vê\n• 4 que pode tocar\n• 3 que pode ouvir\n• 2 que pode sentir\n• 1 que pode cheirar"],
-       ['icone'=>'🌿','titulo'=>'Fechamento','texto'=>'Você está aqui. Agora. Seguro.'],
-     ]],
+// ── Frase do dia (aleatória para pacientes) ───────────────────────────────────
+$frase_row = $pdo->query("
+    SELECT texto, autor FROM frases WHERE tipo='paciente' AND ativo=1 ORDER BY RAND() LIMIT 1
+")->fetch(PDO::FETCH_ASSOC);
+$frase = $frase_row ? $frase_row['texto'] : '"Cuidar de você também é prioridade."';
+$frase_autor = $frase_row['autor'] ?? null;
+
+// ── Playlists ─────────────────────────────────────────────────────────────────
+$playlists = $pdo->query("
+    SELECT id, emoji, nome, url FROM playlists WHERE ativo=1 ORDER BY ordem ASC
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// ── Avisos da coordenação (ativos) ────────────────────────────────────────────
+$avisos = $pdo->query("
+    SELECT id, tipo, titulo, texto, criado_em
+    FROM avisos WHERE ativo=1 ORDER BY criado_em DESC LIMIT 5
+")->fetchAll(PDO::FETCH_ASSOC);
+
+// ── Minhas sugestões (últimas 3) ──────────────────────────────────────────────
+$minhas_sug = $pdo->prepare("
+    SELECT id, tipo, mensagem, lida, resposta, respondido_em, criado_em
+    FROM sugestoes WHERE paciente_id = ? ORDER BY criado_em DESC LIMIT 3
+");
+$minhas_sug->execute([$uid]); $minhas_sug = $minhas_sug->fetchAll(PDO::FETCH_ASSOC);
+
+$dias_nomes   = [1=>'Segunda',2=>'Terça',3=>'Quarta',4=>'Quinta',5=>'Sexta'];
+$status_label = ['pendente'=>'Aguardando','confirmado'=>'Confirmado','cancelado'=>'Cancelado','concluido'=>'Concluído'];
+
+// ── Recomendações por humor ───────────────────────────────────────────────────
+$recomendacoes = [
+    'bem'           => ['titulo'=>'Meditação da Presença','desc'=>'Aproveite este momento positivo com 10 min de atenção plena.','icon'=>'self_improvement','cor'=>'text-emerald-600','bg'=>'bg-emerald-50'],
+    'neutro'        => ['titulo'=>'Respiração Guiada','desc'=>'Equilibre sua energia com uma técnica simples de respiração.','icon'=>'air','cor'=>'text-blue-600','bg'=>'bg-blue-50'],
+    'cansado'       => ['titulo'=>'Escalda-pés Relaxante','desc'=>'Um ritual ancestral para descarregar tensões e preparar o sono.','icon'=>'spa','cor'=>'text-purple-600','bg'=>'bg-purple-50'],
+    'ansioso'       => ['titulo'=>'Respiração 4-7-8','desc'=>'Para acalmar a mente ansiosa. Inspire 4s, segure 7s, expire 8s.','icon'=>'wind_power','cor'=>'text-pink-600','bg'=>'bg-pink-50'],
+    'sobrecarregado'=> ['titulo'=>'Pausa Restauradora','desc'=>'5 minutos de silêncio consciente podem mudar seu dia.','icon'=>'battery_charging_full','cor'=>'text-amber-600','bg'=>'bg-amber-50'],
+    'triste'        => ['titulo'=>'Automassagem nos Pés','desc'=>'Técnica simples que estimula pontos de bem-estar emocional.','icon'=>'favorite','cor'=>'text-rose-600','bg'=>'bg-rose-50'],
 ];
 
-$cores = [['bg'=>'#E1F5EE','txt'=>'#085041'],['bg'=>'#E6F1FB','txt'=>'#0C447C'],['bg'=>'#FAEEDA','txt'=>'#633806'],['bg'=>'#FBEAF0','txt'=>'#72243E'],['bg'=>'#EAF3DE','txt'=>'#27500A']];
-function ini($n){$p=explode(' ',$n);$i='';foreach($p as $x){$i.=strtoupper(mb_substr($x,0,1));if(strlen($i)>=2)break;}return $i;}
+// Guias de cada prática (texto + playlist sugerida)
+$guias = [
+    'bem'           => 'Sente-se confortavelmente. Feche os olhos. Observe sua respiração natural por 10 minutos, sem tentar controlá-la. Simplesmente observe. Quando a mente dispersar, gentilmente retorne à respiração.',
+    'neutro'        => 'Inspire pelo nariz contando até 4. Segure o ar contando até 2. Expire pela boca contando até 6. Repita 8 vezes. Faça isso 3 vezes ao dia para manter o equilíbrio.',
+    'cansado'       => 'Coloque os pés numa bacia com água morna (38–40°C). Adicione 2 col. de sal grosso e algumas gotas de lavanda. Fique 20 minutos com os olhos fechados. Seque bem ao finalizar.',
+    'ansioso'       => 'Inspire pelo nariz contando até 4. Segure o ar contando até 7. Expire pela boca contando até 8. Repita 4 vezes. Esta técnica ativa o sistema nervoso parassimpático em minutos.',
+    'sobrecarregado'=> 'Pare o que está fazendo. Olhe ao redor e nomeie 5 coisas que vê, 4 que pode tocar, 3 que ouve, 2 que cheira, 1 que saboreia. Esta técnica de grounding traz você de volta ao presente.',
+    'triste'        => 'Com as mãos aquecidas, massageie a sola dos pés com movimentos circulares do calcanhar até os dedos. Aplique pressão nos pontos centrais. Faça por 5 minutos em cada pé. Respire profundamente.',
+];
 ?>
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NUPICS — Portal do Paciente</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
-  <script>tailwind.config={theme:{extend:{fontFamily:{headline:['Plus Jakarta Sans'],body:['Manrope']},colors:{primary:'#4e0078',secondary:'#b7004d'}}}}</script>
-  <style>
-    body{font-family:'Manrope',sans-serif;background:radial-gradient(circle at top left,#f7eaf8,#fff7fc);}
-    h1,h2,h3,.headline{font-family:'Plus Jakarta Sans',sans-serif;}
-    .material-symbols-outlined{font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24;}
-    .glass{background:rgba(255,255,255,0.65);backdrop-filter:blur(12px);}
-    .grad{background:linear-gradient(135deg,#4e0078,#b7004d);}
-    .pratica-modal{display:none;position:fixed;inset:0;z-index:100;background:rgba(32,25,35,0.6);backdrop-filter:blur(6px);align-items:center;justify-content:center;padding:1rem;}
-    .pratica-modal.open{display:flex;}
-    .modal-just{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:1rem;}
-    .modal-just.open{display:flex;}
-    .passo-item{transition:all .3s;}
-    .passo-item.ativo{background:linear-gradient(135deg,rgba(78,0,120,.07),rgba(183,0,77,.07));border-left:3px solid #4e0078;}
-    ::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-thumb{background:#d0c2d3;border-radius:2px;}
-    .player-prog{height:4px;border-radius:2px;background:linear-gradient(90deg,#4e0078,#b7004d);width:25%;}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NUPICS | Meu Painel</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<script>
+  tailwind.config = {
+    darkMode:"class",
+    theme:{extend:{
+      colors:{
+        "surface":"#fff7fc","on-surface":"#201923",
+        "surface-container-low":"#fdeffe","surface-container":"#f7eaf8",
+        "surface-container-high":"#f2e4f2","surface-container-highest":"#ecdeed",
+        "surface-container-lowest":"#ffffff","on-surface-variant":"#4d4351",
+        "outline-variant":"#d0c2d3","outline":"#7f7383",
+        "primary":"#4e0078","on-primary":"#ffffff","primary-container":"#6a1b9a",
+        "secondary":"#b7004d","on-secondary":"#ffffff","secondary-fixed":"#ffd9de",
+        "tertiary-fixed":"#f4dce4","on-tertiary-fixed":"#25181e",
+        "error":"#ba1a1a","error-container":"#ffdad6","on-error-container":"#93000a",
+        "background":"#fff7fc","on-background":"#201923"
+      },
+      fontFamily:{"headline":["Plus Jakarta Sans"],"body":["Manrope"]}
+    }}
+  }
+</script>
+<style>
+  body { font-family:"Manrope",sans-serif; background:radial-gradient(circle at top left,#f7eaf8,#fff7fc); }
+  h1,h2,h3,h4 { font-family:"Plus Jakarta Sans",sans-serif }
+  .material-symbols-outlined { font-variation-settings:"FILL" 0,"wght" 400,"GRAD" 0,"opsz" 24 }
+  .glass { background:rgba(255,255,255,.72); backdrop-filter:blur(16px) saturate(180%);
+           -webkit-backdrop-filter:blur(16px) saturate(180%); border:1px solid rgba(255,255,255,.45); }
+  .modal-wrap { display:none; }
+  .modal-wrap.open { display:flex; animation:mfade .18s ease; }
+  @keyframes mfade { from{opacity:0} to{opacity:1} }
+  .modal-card { animation:mup .22s cubic-bezier(.22,1,.36,1); }
+  @keyframes mup { from{opacity:0;transform:translateY(22px)} to{opacity:1;transform:translateY(0)} }
+  .card-item { transition:box-shadow .15s,transform .15s; cursor:pointer; }
+  .card-item:hover { transform:translateY(-2px); box-shadow:0 8px 28px rgba(78,0,120,.10); }
+  .tab-btn { border-bottom:2px solid transparent; transition:color .15s,border-color .15s; }
+  .tab-btn.active { color:#4e0078; border-bottom-color:#4e0078; }
+  .humor-btn .ring-sel { display:none; }
+  .humor-btn.selecionado .ring-sel { display:block; }
+  .humor-btn.selecionado .ic-wrap { background:rgba(78,0,120,.12); }
+  .s-pendente   { background:#f4d9ff; color:#4e0078; }
+  .s-confirmado { background:#d1fae5; color:#065f46; }
+  .s-cancelado  { background:#ffdad6; color:#93000a; }
+  .s-concluido  { background:#e0e7ff; color:#3730a3; }
+  .aviso-evento    { border-left:3px solid #4e0078; }
+  .aviso-urgente   { border-left:3px solid #b7004d; }
+  .aviso-manutencao{ border-left:3px solid #92400e; }
+  .aviso-info      { border-left:3px solid #1d4ed8; }
+  textarea:focus,input:focus,select:focus { outline:none; box-shadow:0 0 0 3px rgba(78,0,120,.15); }
+  @keyframes softpulse { 0%,100%{box-shadow:0 0 0 0 rgba(78,0,120,.15)} 50%{box-shadow:0 0 0 8px rgba(78,0,120,0)} }
+  .proxima-pulse { animation:softpulse 3s ease-in-out infinite; }
+</style>
 </head>
-<body class="text-gray-900 min-h-screen">
+<body class="text-on-background min-h-screen">
 
-<!-- TOPNAV -->
-<nav class="fixed top-0 w-full z-50 bg-white/70 backdrop-blur-md shadow-sm">
-  <div class="flex justify-between items-center px-5 md:px-10 h-14 max-w-7xl mx-auto">
-    <span class="text-lg font-extrabold headline"
-          style="background:linear-gradient(135deg,#4e0078,#b7004d);-webkit-background-clip:text;-webkit-text-fill-color:transparent">
-      NUPICS
-    </span>
-    <div class="hidden md:flex items-center gap-7 font-semibold text-sm">
-      <a href="dashboard.php" class="text-purple-900 border-b-2 border-purple-700 pb-0.5">Início</a>
-      <a href="agendar.php"   class="text-gray-500 hover:text-purple-700 transition-colors">Agendar</a>
-      <a href="visita.php"    class="text-gray-500 hover:text-purple-700 transition-colors">Visita</a>
+<!-- Nav -->
+<nav class="fixed top-0 w-full z-50 bg-white/60 backdrop-blur-md shadow-[0_4px_24px_rgba(32,25,35,.06)]">
+  <div class="flex justify-between items-center px-6 md:px-10 py-4 max-w-7xl mx-auto">
+    <span class="text-xl font-bold bg-gradient-to-r from-purple-700 to-pink-600 bg-clip-text text-transparent font-['Plus_Jakarta_Sans']">NUPICS</span>
+    <div class="hidden md:flex items-center gap-8 font-['Plus_Jakarta_Sans'] font-medium text-sm">
+      <span class="text-primary border-b-2 border-primary pb-0.5">Início</span>
+      <a href="agendar.php" class="text-on-surface-variant hover:text-primary transition-colors">Agendar Sessão</a>
+      <a href="../logout.php" class="text-on-surface-variant hover:text-secondary transition-colors font-semibold">Sair</a>
     </div>
-    <div class="flex items-center gap-2">
-      <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
-           style="background:#E1F5EE;color:#085041"><?= ini($paciente['nome']) ?></div>
-      <span class="text-sm font-semibold text-gray-600 hidden md:block"><?= htmlspecialchars($primeiro) ?></span>
-      <a href="../api/trocar_senha.php"
-         class="text-xs text-purple-400 hover:text-purple-700 border border-purple-200 rounded-full px-3 py-1 transition-colors hidden md:block">Senha</a>
-      <a href="../api/logout.php"
-         class="text-xs text-purple-400 hover:text-purple-700 border border-purple-200 rounded-full px-3 py-1 transition-colors">Sair</a>
-    </div>
+    <button id="mob-btn" class="md:hidden text-primary">
+      <span class="material-symbols-outlined">menu</span>
+    </button>
+  </div>
+  <div id="mob-menu" class="hidden md:hidden bg-white/90 backdrop-blur-md border-t border-outline-variant/20 px-6 py-4 space-y-3">
+    <a href="agendar.php" class="block text-sm font-medium text-on-surface-variant hover:text-primary">Agendar Sessão</a>
+    <a href="../logout.php" class="block text-sm font-semibold text-secondary">Sair</a>
   </div>
 </nav>
 
-<main class="pt-20 pb-20 px-4 md:px-8 max-w-7xl mx-auto space-y-10">
+<main class="pt-28 pb-20 px-4 md:px-8 max-w-7xl mx-auto space-y-12">
 
-  <?php if ($sucesso): ?>
-  <div class="bg-green-50 border border-green-200 text-green-800 rounded-xl px-4 py-3 text-sm font-medium mt-2">
-    ✓ <?= htmlspecialchars($sucesso) ?>
-  </div>
-  <?php endif; ?>
-  <?php if ($erro): ?>
-  <div class="bg-red-50 border border-red-200 text-red-700 rounded-xl px-4 py-3 text-sm font-medium mt-2">
-    ⚠ <?= htmlspecialchars($erro) ?>
-  </div>
-  <?php endif; ?>
-
-  <!-- HERO -->
-  <section class="grid grid-cols-1 md:grid-cols-12 gap-5 items-end mt-2">
-    <div class="md:col-span-8">
-      <h1 class="text-3xl md:text-4xl font-extrabold headline text-purple-900">
+  <!-- ── Cabeçalho ── -->
+  <section class="grid grid-cols-1 md:grid-cols-12 gap-6 items-end">
+    <div class="md:col-span-8 space-y-3">
+      <h1 class="text-4xl md:text-5xl font-extrabold text-primary tracking-tight">
         Olá, <?= htmlspecialchars($primeiro) ?> 👋
       </h1>
-      <p class="text-gray-500 mt-2 max-w-xl">Cuidar de você também é prioridade. Respire fundo e aproveite seu momento de paz.</p>
+      <p class="text-lg text-on-surface-variant max-w-xl">
+        <?= htmlspecialchars(strip_tags($frase)) ?>
+        <?php if ($frase_autor): ?><span class="text-sm text-outline"> — <?= htmlspecialchars($frase_autor) ?></span><?php endif; ?>
+      </p>
     </div>
+    <!-- Próxima sessão resumida no header (só se existir) -->
+    <?php if ($proxima):
+      $phi = substr($proxima['hora_inicio'],0,5);
+      $diasAte = (int)floor((strtotime($proxima['data_sessao']) - strtotime(date('Y-m-d'))) / 86400);
+      $quando = $diasAte === 0 ? 'Hoje' : ($diasAte === 1 ? 'Amanhã' : "Em {$diasAte} dias");
+    ?>
     <div class="md:col-span-4">
-      <?php if ($proximo): ?>
-      <div class="glass p-4 rounded-2xl border border-purple-100/40 shadow-sm flex items-center gap-3">
-        <div class="w-11 h-11 rounded-full flex items-center justify-center text-white flex-shrink-0 grad">
-          <span class="material-symbols-outlined" style="font-size:20px">calendar_today</span>
+      <div class="glass p-5 rounded-2xl flex items-center gap-4 border border-primary/10">
+        <div class="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+          <span class="material-symbols-outlined text-primary">calendar_today</span>
         </div>
         <div>
-          <p class="text-[10px] font-bold uppercase tracking-widest text-purple-400">Próximo Atendimento</p>
-          <p class="font-bold text-purple-900 text-sm"><?= htmlspecialchars($proximo['especialidade'] ?? 'Sessão') ?></p>
-          <p class="text-xs font-semibold text-pink-600">
+          <p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-0.5">Próximo atendimento</p>
+          <p class="font-bold text-primary text-sm"><?= htmlspecialchars($proxima['terapeuta_nome']) ?></p>
+          <p class="text-xs text-secondary font-semibold"><?= $quando ?> às <?= $phi ?></p>
+        </div>
+      </div>
+    </div>
+    <?php endif; ?>
+  </section>
+
+  <!-- ── Stats ── -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="glass rounded-2xl p-5 border-l-4 border-l-primary">
+      <p class="text-xs font-bold uppercase tracking-widest text-primary/60 mb-1">Total</p>
+      <p class="text-3xl font-extrabold text-primary"><?= $total ?></p>
+      <p class="text-xs text-on-surface-variant mt-0.5">sessões</p>
+    </div>
+    <div class="glass rounded-2xl p-5 border-l-4 border-l-emerald-500">
+      <p class="text-xs font-bold uppercase tracking-widest text-emerald-700/60 mb-1">Confirmadas</p>
+      <p class="text-3xl font-extrabold text-emerald-700"><?= $proximas ?></p>
+      <p class="text-xs text-on-surface-variant mt-0.5">aguardando</p>
+    </div>
+    <div class="glass rounded-2xl p-5 border-l-4 border-l-purple-400">
+      <p class="text-xs font-bold uppercase tracking-widest text-purple-700/60 mb-1">Pendentes</p>
+      <p class="text-3xl font-extrabold text-purple-700"><?= $pendentes ?></p>
+      <p class="text-xs text-on-surface-variant mt-0.5">em análise</p>
+    </div>
+    <div class="glass rounded-2xl p-5 border-l-4 border-l-indigo-400">
+      <p class="text-xs font-bold uppercase tracking-widest text-indigo-700/60 mb-1">Concluídas</p>
+      <p class="text-3xl font-extrabold text-indigo-700"><?= $concluidas ?></p>
+      <p class="text-xs text-on-surface-variant mt-0.5">realizadas</p>
+    </div>
+  </div>
+
+  <!-- ── Grid principal ── -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+    <!-- COLUNA ESQUERDA + CENTRO (2/3) -->
+    <div class="lg:col-span-2 space-y-8">
+
+      <!-- Próxima sessão detalhada -->
+      <?php if ($proxima):
+        $d    = (int)$proxima['dia_semana'];
+        $hi   = substr($proxima['hora_inicio'],0,5);
+        $hf   = substr($proxima['hora_fim'],0,5);
+        $dt   = date('d/m/Y', strtotime($proxima['data_sessao']));
+        $diasAte = (int)floor((strtotime($proxima['data_sessao']) - strtotime(date('Y-m-d'))) / 86400);
+        $praticasArr = array_map('trim', explode(',', $proxima['praticas'] ?? ''));
+      ?>
+      <div class="proxima-pulse glass rounded-3xl p-6 bg-gradient-to-br from-primary/5 to-secondary/5 border-2 border-primary/15 relative overflow-hidden">
+        <div class="absolute -right-8 -top-8 w-40 h-40 bg-primary/8 rounded-full blur-2xl pointer-events-none"></div>
+        <div class="relative z-10">
+          <div class="flex items-center justify-between mb-5">
+            <div>
+              <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-1">Próxima sessão</p>
+              <h2 class="text-xl font-extrabold text-primary"><?= $dias_nomes[$d] ?>, <?= $dt ?></h2>
+            </div>
             <?php
-            $dt   = new DateTime($proximo['data']);
-            $hoje = new DateTime();
-            $diff = (int)$hoje->diff($dt)->days;
-            $pre  = $diff === 0 ? 'Hoje' : ($diff === 1 ? 'Amanhã' : $dt->format('d/m'));
-            echo $pre . ' às ' . substr($proximo['hora_inicio'],0,5);
+            if ($diasAte===0)     echo '<span class="px-3 py-1.5 rounded-full bg-emerald-100 text-emerald-700 text-xs font-bold">Hoje!</span>';
+            elseif ($diasAte===1) echo '<span class="px-3 py-1.5 rounded-full bg-amber-100 text-amber-700 text-xs font-bold">Amanhã</span>';
+            else                  echo "<span class='px-3 py-1.5 rounded-full bg-primary/10 text-primary text-xs font-bold'>Em {$diasAte} dias</span>";
             ?>
-          </p>
+          </div>
+          <div class="grid grid-cols-2 gap-3 mb-4">
+            <div class="flex items-center gap-2 bg-white/50 rounded-xl px-3 py-2.5 border border-white/60">
+              <span class="material-symbols-outlined text-secondary text-lg shrink-0">schedule</span>
+              <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Horário</p>
+                   <p class="font-bold text-sm text-on-surface"><?= $hi ?> – <?= $hf ?></p></div>
+            </div>
+            <div class="flex items-center gap-2 bg-white/50 rounded-xl px-3 py-2.5 border border-white/60">
+              <span class="material-symbols-outlined text-secondary text-lg shrink-0">person</span>
+              <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Terapeuta</p>
+                   <p class="font-bold text-sm text-on-surface truncate"><?= htmlspecialchars($proxima['terapeuta_nome']) ?></p></div>
+            </div>
+            <div class="flex items-center gap-2 bg-white/50 rounded-xl px-3 py-2.5 border border-white/60 col-span-2">
+              <span class="material-symbols-outlined text-secondary text-lg shrink-0">location_on</span>
+              <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Local</p>
+                   <p class="font-bold text-sm text-on-surface"><?= htmlspecialchars($proxima['local'] ?? 'A definir') ?></p></div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 mb-4">
+            <?php foreach ($praticasArr as $p): if (!$p) continue; ?>
+            <span class="px-3 py-1 rounded-full bg-primary/10 text-primary text-xs font-bold"><?= htmlspecialchars($p) ?></span>
+            <?php endforeach; ?>
+          </div>
+          <button onclick="abrirDetalhe(<?= htmlspecialchars(json_encode($proxima), ENT_QUOTES) ?>)"
+            class="w-full py-3 rounded-full border-2 border-primary/30 text-primary font-bold text-sm hover:bg-primary/5 transition-all flex items-center justify-center gap-2">
+            <span class="material-symbols-outlined text-sm">info</span>Ver detalhes / cancelar
+          </button>
         </div>
       </div>
       <?php else: ?>
-      <div class="glass p-4 rounded-2xl border border-dashed border-purple-200 text-center">
-        <p class="text-sm text-purple-400">Nenhuma sessão agendada</p>
-        <a href="agendar.php" class="text-sm font-bold text-purple-700 mt-1 block hover:underline">Agendar agora →</a>
-      </div>
-      <?php endif; ?>
-    </div>
-  </section>
-
-  <!-- CHECK-IN + NUPICS INFO -->
-  <section class="grid grid-cols-1 md:grid-cols-3 gap-5">
-    <div class="md:col-span-2 glass p-6 rounded-2xl border border-purple-100/30 space-y-5">
-      <div class="flex justify-between items-center">
-        <h2 class="text-lg font-bold headline text-gray-800">Como você está se sentindo hoje?</h2>
-        <span class="material-symbols-outlined text-purple-300" style="font-size:24px">mood</span>
-      </div>
-      <div class="flex flex-wrap justify-between gap-2">
-        <?php
-        $emocoes = [
-          ['icon'=>'sentiment_very_satisfied','label'=>'Bem'],
-          ['icon'=>'sentiment_neutral','label'=>'Neutro'],
-          ['icon'=>'battery_low','label'=>'Cansado'],
-          ['icon'=>'psychology','label'=>'Ansioso','destaque'=>true],
-          ['icon'=>'layers_clear','label'=>'Sobrecarregado'],
-          ['icon'=>'sentiment_dissatisfied','label'=>'Triste'],
-        ];
-        foreach ($emocoes as $e):
-          $bg = ($e['destaque'] ?? false) ? 'bg-pink-100' : 'bg-gray-100';
-        ?>
-        <button class="flex flex-col items-center gap-1.5 group" onclick="selecionarEmocao(this,'<?= $e['label'] ?>')">
-          <div class="w-12 h-12 rounded-full <?= $bg ?> hover:bg-purple-100 flex items-center justify-center transition-all group-hover:scale-110">
-            <span class="material-symbols-outlined text-purple-700" style="font-size:24px"><?= $e['icon'] ?></span>
-          </div>
-          <span class="text-[11px] font-medium text-gray-600"><?= $e['label'] ?></span>
-        </button>
-        <?php endforeach; ?>
-      </div>
-      <div class="rounded-2xl flex items-center gap-4 p-4" style="background:#ffd9de">
-        <div class="p-2 bg-white/60 rounded-full flex-shrink-0">
-          <span class="material-symbols-outlined text-pink-700" style="font-size:20px">wind_power</span>
-        </div>
-        <div class="flex-1">
-          <p class="font-bold text-gray-800 text-sm" id="sugestao-titulo">Sugerimos: Respiração Guiada</p>
-          <p class="text-xs text-gray-600" id="sugestao-desc">Para acalmar a mente ansiosa em apenas 5 minutos.</p>
-        </div>
-        <button onclick="abrirPratica('respiracao')"
-                class="px-4 py-2 text-white text-xs font-bold rounded-full hover:opacity-90 whitespace-nowrap"
-                style="background:#b7004d">
-          Começar
-        </button>
-      </div>
-    </div>
-
-    <div class="rounded-2xl text-white relative overflow-hidden p-6 flex flex-col justify-between min-h-[240px] grad">
-      <div class="relative z-10 space-y-3">
-        <h3 class="text-lg font-extrabold headline">NUPICS Caicó</h3>
-        <p class="text-purple-200 text-sm leading-relaxed">
-          Projeto de extensão da UERN com atendimentos integrativos gratuitos para toda a comunidade, sob supervisão docente.
-        </p>
-        <a href="agendar.php"
-           class="inline-block py-2 px-5 bg-white text-purple-900 font-bold text-sm rounded-full hover:bg-purple-50 transition-colors">
-          Agendar sessão →
+      <div class="glass rounded-3xl p-10 text-center border border-outline-variant/20">
+        <span class="material-symbols-outlined text-5xl text-outline-variant mb-3 block">event_note</span>
+        <h3 class="font-headline font-bold text-on-surface text-lg mb-2">Nenhuma sessão agendada</h3>
+        <p class="text-sm text-on-surface-variant mb-5">Agende sua próxima sessão de práticas integrativas.</p>
+        <a href="agendar.php" class="inline-flex items-center gap-2 px-6 py-3 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90 transition-all shadow-lg shadow-primary/25">
+          <span class="material-symbols-outlined text-sm">add_circle</span>Agendar agora
         </a>
       </div>
-      <div class="absolute -bottom-6 -right-6 opacity-20">
-        <span class="material-symbols-outlined" style="font-size:120px">eco</span>
+      <?php endif; ?>
+
+      <!-- Fila de espera -->
+      <?php if (!empty($filas)): ?>
+      <div class="glass rounded-2xl p-5 border border-amber-200/60">
+        <div class="flex items-center gap-2 mb-3">
+          <span class="material-symbols-outlined text-amber-500">queue</span>
+          <h3 class="font-headline font-bold text-on-surface text-sm">Na fila de espera</h3>
+        </div>
+        <div class="space-y-2">
+          <?php foreach ($filas as $f): ?>
+          <div class="flex items-center justify-between bg-amber-50/70 rounded-xl px-4 py-3 border border-amber-100">
+            <div>
+              <p class="text-xs font-bold text-amber-800"><?= $dias_nomes[(int)$f['dia_semana']] ?> • <?= substr($f['hora_inicio'],0,5) ?> – <?= substr($f['hora_fim'],0,5) ?></p>
+              <p class="text-xs text-amber-700 mt-0.5"><?= htmlspecialchars($f['terapeuta_nome']) ?></p>
+            </div>
+            <span class="text-xs font-bold px-2.5 py-1 rounded-full bg-amber-100 text-amber-700">
+              <?= $f['status'] === 'notificado' ? '🔔 Vaga disponível!' : "Posição {$f['posicao']}" ?>
+            </span>
+          </div>
+          <?php endforeach; ?>
+        </div>
       </div>
-    </div>
-  </section>
+      <?php endif; ?>
 
-  <!-- AÇÕES RÁPIDAS -->
-  <section class="space-y-4">
-    <h2 class="text-xl font-extrabold headline text-gray-800">Ações Rápidas</h2>
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
-      <?php
-      $acoes = [
-        ['icon'=>'add_circle',  'label'=>'Agendar',         'href'=>'agendar.php',  'cor'=>'text-purple-700'],
-        ['icon'=>'event_repeat','label'=>'Reagendar',       'href'=>'agendar.php',  'cor'=>'text-purple-700'],
-        ['icon'=>'cancel',      'label'=>'Cancelar',        'href'=>'dashboard.php','cor'=>'text-red-500'],
-        ['icon'=>'group',       'label'=>'Ver Terapeuta',   'href'=>'dashboard.php','cor'=>'text-purple-700'],
-        ['icon'=>'map',         'label'=>'Solicitar Visita','href'=>'visita.php',   'cor'=>'text-purple-700'],
-      ];
-      foreach ($acoes as $a):
-      ?>
-      <a href="<?= $a['href'] ?>"
-         class="glass border border-white/60 rounded-2xl p-4 flex flex-col items-center gap-2 hover:shadow-lg transition-all group">
-        <span class="material-symbols-outlined text-2xl <?= $a['cor'] ?> group-hover:scale-110 transition-transform"><?= $a['icon'] ?></span>
-        <span class="text-xs font-semibold text-gray-700 text-center"><?= $a['label'] ?></span>
-      </a>
-      <?php endforeach; ?>
-    </div>
-  </section>
-
-  <!-- GRADE PRINCIPAL -->
-  <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-
-    <!-- COLUNA ESQUERDA -->
-    <div class="lg:col-span-8 space-y-10">
-
-      <!-- Práticas -->
-      <section class="space-y-4">
-        <h2 class="text-xl font-extrabold headline text-gray-800">Seu Momento de Cuidado</h2>
-
-        <!-- 2 práticas em destaque -->
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <?php foreach (array_slice($praticas, 0, 2) as $pr): ?>
-          <div class="glass rounded-2xl overflow-hidden group hover:shadow-xl transition-all cursor-pointer"
-               onclick="abrirPratica('<?= $pr['id'] ?>')">
-            <div class="h-36 relative overflow-hidden">
-              <img src="<?= $pr['img'] ?>" alt="<?= $pr['titulo'] ?>"
-                   class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700">
-              <div class="absolute inset-0" style="background:linear-gradient(to top,rgba(0,0,0,.6),transparent)"></div>
-              <span class="absolute bottom-2 left-3 text-[9px] uppercase font-bold tracking-widest text-white px-2 py-0.5 rounded <?= $pr['badge']['cor'] ?>">
-                <?= $pr['badge']['txt'] ?>
-              </span>
-            </div>
-            <div class="p-4 space-y-1.5">
-              <div class="flex justify-between items-start">
-                <h4 class="font-bold text-sm text-gray-800"><?= $pr['titulo'] ?></h4>
-                <span class="text-[10px] text-gray-400 ml-2 whitespace-nowrap"><?= $pr['duracao'] ?></span>
-              </div>
-              <p class="text-xs text-gray-500"><?= $pr['desc'] ?></p>
-              <button class="flex items-center gap-1 text-purple-700 font-bold text-xs">
-                <span class="material-symbols-outlined" style="font-size:16px;font-variation-settings:'FILL' 1">play_circle</span>
-                Começar prática
-              </button>
-            </div>
+      <!-- Check-in emocional -->
+      <div class="glass rounded-3xl p-7 border border-outline-variant/20">
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h2 class="text-xl font-extrabold text-on-surface">Como você está hoje?</h2>
+            <p class="text-sm text-on-surface-variant mt-0.5">Escolha e receba uma sugestão personalizada</p>
           </div>
+          <span class="material-symbols-outlined text-primary/40 text-3xl">mood</span>
+        </div>
+
+        <div class="grid grid-cols-3 sm:grid-cols-6 gap-3 mb-6">
+          <?php
+          $humores = [
+            'bem'           => ['icon'=>'sentiment_very_satisfied','label'=>'Bem','cor'=>'text-emerald-600'],
+            'neutro'        => ['icon'=>'sentiment_neutral',       'label'=>'Neutro','cor'=>'text-blue-600'],
+            'cansado'       => ['icon'=>'battery_low',             'label'=>'Cansado','cor'=>'text-amber-600'],
+            'ansioso'       => ['icon'=>'psychology',              'label'=>'Ansioso','cor'=>'text-pink-600'],
+            'sobrecarregado'=> ['icon'=>'layers_clear',            'label'=>'Sobrec.','cor'=>'text-orange-600'],
+            'triste'        => ['icon'=>'sentiment_dissatisfied',  'label'=>'Triste','cor'=>'text-rose-600'],
+          ];
+          foreach ($humores as $key => $h): ?>
+          <button class="humor-btn flex flex-col items-center gap-2 relative group" data-humor="<?= $key ?>">
+            <div class="ic-wrap w-14 h-14 rounded-full bg-surface-container-high flex items-center justify-center group-hover:bg-primary/10 transition-all relative">
+              <span class="material-symbols-outlined text-2xl <?= $h['cor'] ?>"><?= $h['icon'] ?></span>
+              <span class="ring-sel absolute inset-0 rounded-full border-2 border-primary pointer-events-none"></span>
+            </div>
+            <span class="text-xs font-medium text-on-surface-variant"><?= $h['label'] ?></span>
+          </button>
           <?php endforeach; ?>
         </div>
 
-        <!-- Grid 4 práticas -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <?php foreach (array_slice($praticas, 2) as $pr): ?>
-          <div class="glass rounded-2xl overflow-hidden cursor-pointer hover:shadow-lg transition-all group"
-               onclick="abrirPratica('<?= $pr['id'] ?>')">
-            <div class="h-24 relative overflow-hidden">
-              <img src="<?= $pr['img'] ?>" alt="<?= $pr['titulo'] ?>"
-                   class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700">
-              <div class="absolute inset-0" style="background:linear-gradient(to top,rgba(0,0,0,.65),transparent)"></div>
-              <span class="absolute bottom-1.5 left-2 text-[8px] uppercase font-bold text-white px-1.5 py-0.5 rounded <?= $pr['badge']['cor'] ?>">
-                <?= $pr['badge']['txt'] ?>
-              </span>
-            </div>
-            <div class="p-2.5">
-              <h4 class="font-bold text-xs text-gray-800 leading-tight"><?= $pr['titulo'] ?></h4>
-              <p class="text-[9px] text-gray-400 mt-0.5"><?= $pr['duracao'] ?></p>
-            </div>
+        <!-- Recomendação dinâmica (escondida até selecionar humor) -->
+        <div id="recomendacao-box" class="hidden rounded-2xl p-5 flex items-center gap-5 transition-all">
+          <div id="rec-icon-wrap" class="p-3 rounded-full shrink-0">
+            <span id="rec-icon" class="material-symbols-outlined text-2xl"></span>
           </div>
-          <?php endforeach; ?>
+          <div class="flex-grow">
+            <p id="rec-titulo" class="font-bold text-on-surface"></p>
+            <p id="rec-desc" class="text-sm text-on-surface-variant mt-0.5"></p>
+          </div>
+          <button id="rec-btn"
+            class="shrink-0 px-5 py-2.5 rounded-full bg-primary text-white text-sm font-bold hover:opacity-90 transition-all"
+            onclick="abrirGuia()">
+            Começar
+          </button>
         </div>
-      </section>
+      </div>
 
-      <!-- Ambiente Terapêutico -->
-      <section class="glass border border-purple-100/30 rounded-2xl p-6 space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="p-2.5 rounded-xl text-white grad">
-            <span class="material-symbols-outlined" style="font-size:20px">graphic_eq</span>
+      <!-- Ambiente / Playlists -->
+      <div class="glass rounded-3xl p-7 border border-outline-variant/20">
+        <div class="flex items-center gap-3 mb-5">
+          <div class="p-2.5 bg-primary rounded-xl text-white">
+            <span class="material-symbols-outlined">graphic_eq</span>
           </div>
           <div>
-            <h3 class="text-lg font-bold headline text-gray-800">Ambiente Terapêutico</h3>
-            <p class="text-xs text-gray-400">Músicas para harmonizar o seu espaço.</p>
+            <h2 class="text-xl font-extrabold text-on-surface">Ambiente Terapêutico</h2>
+            <p class="text-xs text-on-surface-variant">Playlists para harmonizar seu espaço</p>
           </div>
         </div>
-
-        <div class="flex flex-col md:flex-row items-center gap-5 rounded-2xl p-4" style="background:#fdeffe">
-          <div class="w-20 h-20 rounded-xl overflow-hidden flex-shrink-0">
-            <img src="https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=200&q=80" class="w-full h-full object-cover">
-          </div>
-          <div class="flex-1 space-y-2 w-full">
-            <div class="flex justify-between items-end">
-              <div>
-                <p class="font-bold text-purple-900 text-sm" id="ambiente-nome">
-                  <?= $playlists[0]['emoji'] ?> <?= $playlists[0]['nome'] ?>
-                </p>
-                <p class="text-xs text-gray-400">Ambiente imersivo</p>
-              </div>
-              <span class="text-xs font-mono text-gray-400">ao vivo</span>
-            </div>
-            <div class="h-1 bg-gray-200 rounded-full"><div class="player-prog" id="player-prog"></div></div>
-            <div class="flex justify-center gap-7 items-center">
-              <button onclick="mudarPlaylist(-1)" class="text-gray-400 hover:text-purple-700 transition-colors">
-                <span class="material-symbols-outlined">skip_previous</span>
-              </button>
-              <button onclick="togglePlayer()"
-                      id="btn-play"
-                      class="w-10 h-10 rounded-full text-white flex items-center justify-center hover:scale-105 transition-all grad">
-                <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1">play_arrow</span>
-              </button>
-              <button onclick="mudarPlaylist(1)" class="text-gray-400 hover:text-purple-700 transition-colors">
-                <span class="material-symbols-outlined">skip_next</span>
-              </button>
-            </div>
-          </div>
-          <button onclick="togglePlayer()"
-                  class="px-5 py-2.5 border-2 border-purple-700 text-purple-700 font-bold text-sm rounded-full hover:bg-purple-700 hover:text-white transition-all whitespace-nowrap">
-            Preparar ambiente
-          </button>
-        </div>
-
-        <div id="yt-container" class="hidden rounded-xl overflow-hidden">
-          <iframe id="yt-frame" width="100%" height="90" frameborder="0" allow="autoplay;encrypted-media" style="border-radius:10px"></iframe>
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          <?php foreach ($playlists as $i => $pl): ?>
-          <button onclick="selecionarPlaylist(<?= $i ?>)"
-                  class="playlist-btn flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-semibold transition-all"
-                  style="border-color:#d0c2d3;color:#4d4351"
-                  data-url="<?= htmlspecialchars($pl['url']) ?>"
-                  data-nome="<?= htmlspecialchars($pl['emoji'].' '.$pl['nome']) ?>">
-            <?= $pl['emoji'] ?> <?= htmlspecialchars($pl['nome']) ?>
+        <div class="flex flex-wrap gap-3">
+          <?php foreach ($playlists as $pl):
+            $yt_id = '';
+            if (preg_match('/(?:v=|youtu\.be\/)([A-Za-z0-9_\-]{11})/', $pl['url'], $m2)) $yt_id = $m2[1];
+          ?>
+          <button onclick="abrirPlaylist('<?= htmlspecialchars($yt_id) ?>','<?= htmlspecialchars($pl['nome'], ENT_QUOTES) ?>')"
+            class="flex items-center gap-2 px-4 py-2.5 rounded-full glass border border-outline-variant/30 hover:border-primary/40 hover:bg-primary/5 transition-all text-sm font-medium text-on-surface">
+            <span><?= $pl['emoji'] ?></span>
+            <?= htmlspecialchars($pl['nome']) ?>
+            <span class="material-symbols-outlined text-sm text-primary/60">play_circle</span>
           </button>
           <?php endforeach; ?>
         </div>
-      </section>
+      </div>
 
-      <!-- Histórico de sessões -->
-      <section class="space-y-3">
-        <h2 class="text-xl font-extrabold headline text-gray-800">Minhas sessões</h2>
-        <?php if (empty($historico)): ?>
-        <div class="glass rounded-2xl p-8 text-center text-gray-400 text-sm">
-          Você ainda não tem sessões agendadas.
+      <!-- Histórico -->
+      <div class="glass rounded-3xl p-7 border border-outline-variant/20">
+        <div class="flex items-center justify-between mb-5">
+          <h2 class="text-xl font-extrabold text-primary">Histórico de sessões</h2>
+          <span class="text-xs text-on-surface-variant"><?= $total ?> no total</span>
+        </div>
+        <!-- Tabs -->
+        <div class="flex gap-5 border-b border-outline-variant mb-5 overflow-x-auto">
+          <?php foreach (['todas'=>'Todas','confirmado'=>'Confirmadas','pendente'=>'Pendentes','concluido'=>'Concluídas','cancelado'=>'Canceladas'] as $k=>$l): ?>
+          <button class="tab-btn pb-3 text-sm font-bold text-on-surface-variant whitespace-nowrap <?= $k==='todas'?'active':'' ?>"
+                  data-tab-h="<?= $k ?>"><?= $l ?></button>
+          <?php endforeach; ?>
+        </div>
+        <?php if (empty($reservas)): ?>
+        <div class="text-center py-12">
+          <span class="material-symbols-outlined text-4xl text-outline-variant mb-3 block">event_note</span>
+          <p class="text-sm text-on-surface-variant mb-4">Nenhuma sessão ainda.</p>
+          <a href="agendar.php" class="inline-flex items-center gap-2 text-sm font-bold text-primary hover:underline">
+            <span class="material-symbols-outlined text-sm">add_circle</span>Agendar a primeira
+          </a>
         </div>
         <?php else: ?>
-        <div class="space-y-2">
-          <?php foreach ($historico as $s):
-            $dt      = new DateTime($s['data']);
-            $data_f  = $dt->format('d/m/Y');
-            $hora_f  = substr($s['hora_inicio'],0,5);
-            $sc      = match($s['status']) {
-              'realizado' => 'bg-blue-100 text-blue-700',
-              'cancelado' => 'bg-gray-100 text-gray-500',
-              'faltou'    => 'bg-red-100 text-red-700',
-              default     => 'bg-green-100 text-green-700',
-            };
-            $st = match($s['status']){'realizado'=>'Realizado','cancelado'=>'Cancelado','faltou'=>'Faltou',default=>'Agendado'};
-            $pode_justificar = ($s['status']==='agendado' && $s['data']>=date('Y-m-d') && !$s['justificativa']);
+        <div id="hist-lista" class="space-y-2.5">
+          <?php foreach ($reservas as $r):
+            $hi = substr($r['hora_inicio'],0,5); $hf = substr($r['hora_fim'],0,5);
+            $dia = $dias_nomes[(int)$r['dia_semana']] ?? '?';
+            $dt2 = date('d/m/Y', strtotime($r['data_sessao']));
+            $st  = $r['status'];
           ?>
-          <div class="glass border border-white/60 rounded-2xl p-4 flex items-start gap-3 flex-wrap">
-            <div class="w-9 h-9 rounded-full grad flex items-center justify-center text-white text-xs font-bold flex-shrink-0 mt-0.5">
-              <?= $s['numero_sessao'] ?>
+          <div class="card-item hist-item flex flex-col sm:flex-row sm:items-center gap-3 bg-surface-container-low/70 rounded-2xl px-5 py-4 border border-outline-variant/15 hover:border-primary/20"
+               data-status="<?= $st ?>"
+               onclick="abrirDetalhe(<?= htmlspecialchars(json_encode($r), ENT_QUOTES) ?>)">
+            <div class="shrink-0 w-9 h-9 rounded-full flex items-center justify-center
+              <?= $st==='confirmado'?'bg-emerald-100 text-emerald-600':($st==='concluido'?'bg-indigo-100 text-indigo-600':($st==='cancelado'?'bg-red-100 text-red-500':'bg-primary/10 text-primary')) ?>">
+              <span class="material-symbols-outlined text-base">
+                <?= $st==='confirmado'?'event_available':($st==='concluido'?'verified':($st==='cancelado'?'event_busy':'pending')) ?>
+              </span>
             </div>
-            <div class="flex-1 min-w-[160px]">
-              <div class="font-bold text-sm text-gray-800">
-                <?= htmlspecialchars($s['terapeuta_nome'] ?? 'Terapeuta') ?>
+            <div class="flex-grow min-w-0">
+              <div class="flex flex-wrap items-center gap-2 mb-0.5">
+                <p class="font-bold text-sm text-on-surface"><?= $dia ?>, <?= $dt2 ?> • <?= $hi ?> – <?= $hf ?></p>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full s-<?= $st ?>"><?= $status_label[$st] ?? $st ?></span>
               </div>
-              <div class="text-xs text-gray-400">
-                <?= htmlspecialchars($s['especialidade'] ?? '—') ?>
-                · <?= $data_f ?> às <?= $hora_f ?>
-                · Sessão <?= $s['numero_sessao'] ?>/<?= $s['total_sessoes'] ?>
-              </div>
-              <?php if ($s['justificativa']): ?>
-              <div class="text-xs text-yellow-700 mt-1 bg-yellow-50 rounded-lg px-2 py-1">
-                ✓ Falta justificada
-              </div>
-              <?php endif; ?>
-              <?php if ($pode_justificar): ?>
-              <button onclick="document.getElementById('just-<?= $s['id'] ?>').classList.add('open')"
-                      class="mt-1.5 text-[10px] font-bold text-yellow-700 border border-yellow-300 bg-yellow-50 rounded-full px-3 py-1 hover:bg-yellow-100 transition-colors">
-                ⚠ Justificar falta
-              </button>
-              <?php endif; ?>
+              <p class="text-xs text-on-surface-variant truncate"><?= htmlspecialchars($r['terapeuta_nome']) ?><?= $r['local'] ? ' · '.htmlspecialchars($r['local']) : '' ?></p>
             </div>
-            <span class="px-2.5 py-1 text-[10px] font-bold rounded-full <?= $sc ?>"><?= $st ?></span>
+            <span class="material-symbols-outlined text-outline-variant hidden sm:block shrink-0">chevron_right</span>
           </div>
-
-          <?php if ($pode_justificar): ?>
-          <!-- Modal justificativa -->
-          <div class="modal-just" id="just-<?= $s['id'] ?>">
-            <div class="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl">
-              <h3 class="text-base font-extrabold headline text-gray-800 mb-2">Justificar falta</h3>
-              <p class="text-xs text-gray-500 mb-4 leading-relaxed">
-                Você tem direito a <strong>1 justificativa por ciclo</strong>.
-                Se faltar sem justificar, a sessão é descartada automaticamente pelo sistema.
-              </p>
-              <form method="POST">
-                <input type="hidden" name="acao" value="justificar_falta">
-                <input type="hidden" name="agendamento_id" value="<?= $s['id'] ?>">
-                <textarea name="justificativa" rows="3" required
-                          placeholder="Explique o motivo da falta..."
-                          class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400 resize-none mb-3 font-sans"></textarea>
-                <div class="flex gap-2">
-                  <button type="button"
-                          onclick="document.getElementById('just-<?= $s['id'] ?>').classList.remove('open')"
-                          class="flex-1 py-2.5 border border-gray-200 rounded-xl font-semibold text-sm text-gray-600 hover:bg-gray-50">
-                    Cancelar
-                  </button>
-                  <button type="submit"
-                          class="flex-1 py-2.5 grad text-white font-bold text-sm rounded-xl hover:opacity-90">
-                    Enviar
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-          <?php endif; ?>
           <?php endforeach; ?>
         </div>
+        <div id="hist-vazio" class="hidden text-center py-8 text-sm text-on-surface-variant">Nenhuma sessão nesta categoria.</div>
         <?php endif; ?>
-      </section>
-
-    </div><!-- fim col esquerda -->
-
-    <!-- COLUNA DIREITA -->
-    <div class="lg:col-span-4 space-y-6">
-
-      <!-- Frase do dia -->
-      <div class="rounded-2xl p-6 relative overflow-hidden" style="background:#f4dce4">
-        <span class="material-symbols-outlined absolute top-2 right-2 opacity-15 rotate-12"
-              style="font-size:60px;color:#3a2c32">format_quote</span>
-        <p class="text-xs font-bold uppercase tracking-widest text-pink-700 mb-2">Inspiração do dia</p>
-        <p class="text-sm italic leading-relaxed relative z-10" style="color:#25181e">
-          <?= htmlspecialchars($frase) ?>
-        </p>
       </div>
 
-      <!-- Ciclo ativo -->
-      <?php if ($ciclo): ?>
-      <div class="glass border border-purple-100/30 rounded-2xl p-5">
-        <h3 class="text-xs font-extrabold uppercase tracking-widest text-purple-400 mb-1">Meu ciclo atual</h3>
-        <p class="text-xs text-gray-500 mb-3">
-          <?= htmlspecialchars($ciclo['terapeuta_nome']) ?> · <?= htmlspecialchars($ciclo['especialidade'] ?? '—') ?>
-        </p>
-        <div class="flex gap-2 mb-2">
-          <?php for ($i = 1; $i <= $ciclo['total_sessoes']; $i++):
-            if ($i <= $ciclo['feitas'])       $cls = 'grad text-white';
-            elseif ($i === $ciclo['feitas']+1) $cls = 'border-2 border-purple-700 text-purple-700 bg-purple-50';
-            else                               $cls = 'bg-gray-100 text-gray-400';
-          ?>
-          <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold <?= $cls ?>">
-            <?= $i ?>
-          </div>
-          <?php endfor; ?>
+    </div><!-- /coluna esquerda -->
+
+    <!-- COLUNA DIREITA (1/3) -->
+    <div class="space-y-6">
+
+      <!-- Avisos da coordenação -->
+      <div class="glass rounded-2xl p-5 border border-primary/10">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="material-symbols-outlined text-primary text-xl">campaign</span>
+          <h3 class="font-headline font-bold text-on-surface">Avisos da coordenação</h3>
         </div>
-        <p class="text-xs text-gray-400"><?= $ciclo['feitas'] ?> de <?= $ciclo['total_sessoes'] ?> sessões realizadas</p>
-        <?php if ($ciclo['faltas_inj'] > 0): ?>
-        <p class="text-xs text-red-500 mt-1 font-semibold">
-          ⚠ <?= $ciclo['faltas_inj'] ?> falta<?= $ciclo['faltas_inj']>1?'s':'' ?> sem justificativa
-        </p>
-        <?php endif; ?>
-      </div>
-      <?php endif; ?>
-
-      <!-- Terapeutas -->
-      <div class="glass border border-purple-100/30 rounded-2xl p-5">
-        <h3 class="text-xs font-extrabold uppercase tracking-widest text-purple-400 mb-3">Nossa equipe</h3>
+        <?php if (empty($avisos)): ?>
+        <p class="text-sm text-on-surface-variant text-center py-3">Nenhum aviso no momento.</p>
+        <?php else: ?>
         <div class="space-y-3">
-          <?php foreach (array_slice($terapeutas, 0, 4) as $i => $t):
-            $cor = $cores[$i % count($cores)];
+          <?php foreach ($avisos as $av):
+            $icones = ['evento'=>'event','urgente'=>'warning','manutencao'=>'build','info'=>'info'];
+            $cores  = ['evento'=>'text-primary','urgente'=>'text-secondary','manutencao'=>'text-amber-600','info'=>'text-blue-600'];
           ?>
-          <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
-                 style="background:<?= $cor['bg'] ?>;color:<?= $cor['txt'] ?>">
-              <?= ini($t['nome']) ?>
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-xs font-bold text-gray-800 truncate"><?= htmlspecialchars($t['nome']) ?></div>
-              <div class="text-[10px] text-gray-400"><?= htmlspecialchars($t['especialidade']) ?></div>
+          <div class="aviso-<?= $av['tipo'] ?> bg-white/60 rounded-xl px-4 py-3">
+            <div class="flex items-start gap-2">
+              <span class="material-symbols-outlined text-sm mt-0.5 <?= $cores[$av['tipo']] ?? 'text-primary' ?> shrink-0">
+                <?= $icones[$av['tipo']] ?? 'info' ?>
+              </span>
+              <div class="min-w-0">
+                <p class="text-xs font-bold text-on-surface"><?= htmlspecialchars($av['titulo']) ?></p>
+                <p class="text-xs text-on-surface-variant mt-0.5 leading-relaxed"><?= htmlspecialchars($av['texto']) ?></p>
+                <p class="text-[10px] text-outline mt-1"><?= date('d/m/Y', strtotime($av['criado_em'])) ?></p>
+              </div>
             </div>
           </div>
           <?php endforeach; ?>
         </div>
-        <a href="agendar.php"
-           class="block w-full py-2 text-center text-purple-700 font-bold text-xs border-t border-gray-100 mt-3 hover:bg-purple-50 rounded-b-xl transition-colors">
-          Agendar com um terapeuta →
-        </a>
+        <?php endif; ?>
       </div>
 
-      <!-- Como funciona -->
-      <div class="glass border border-purple-100/30 rounded-2xl p-5 space-y-2">
-        <h3 class="font-bold text-gray-800 flex items-center gap-2 text-sm">
-          <span class="material-symbols-outlined text-purple-600" style="font-size:18px">help_center</span>
-          Como Funciona?
-        </h3>
-        <p class="text-xs text-gray-500">Atendimentos 100% gratuitos para a comunidade de Caicó/RN.</p>
-        <div class="flex items-center gap-2 text-xs text-gray-600">
-          <span class="material-symbols-outlined text-purple-600" style="font-size:14px">location_on</span>
-          Campus UERN, Caicó/RN
+      <!-- Bem-estar -->
+      <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="material-symbols-outlined text-secondary">favorite</span>
+          <h3 class="font-headline font-bold text-on-surface">Bem-estar</h3>
         </div>
-        <div class="flex items-center gap-2 text-xs text-gray-600">
-          <span class="material-symbols-outlined text-purple-600" style="font-size:14px">schedule</span>
-          Ciclos de 4 sessões semanais
+        <?php if ($bem_estar !== null): ?>
+        <div class="text-center mb-3">
+          <p class="text-5xl font-extrabold text-primary"><?= $bem_estar ?></p>
+          <p class="text-xs text-on-surface-variant mt-1">de 10 no cadastro</p>
         </div>
-        <a href="visita.php"
-           class="block w-full py-2 text-center text-purple-700 font-bold text-xs border-t border-gray-100 mt-2 hover:bg-purple-50 rounded-b-xl transition-colors">
-          Solicitar visita externa →
-        </a>
+        <div class="w-full bg-surface-container-highest rounded-full h-2.5 mb-2">
+          <div class="h-2.5 rounded-full" style="width:<?= ($bem_estar/10)*100 ?>%;background:linear-gradient(90deg,#10b981,#a855f7,#ec4899)"></div>
+        </div>
+        <p class="text-xs text-center text-on-surface-variant">
+          <?php echo $bem_estar<=3?'😔 Vamos cuidar de você':($bem_estar<=6?'😐 Espaço para melhorar':($bem_estar<=8?'🙂 Indo bem!':'😊 Ótimo estado!')); ?>
+        </p>
+        <?php else: ?>
+        <p class="text-sm text-on-surface-variant text-center py-3">Não informado.</p>
+        <?php endif; ?>
       </div>
 
-    </div>
-  </div>
+      <!-- Ações rápidas -->
+      <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+        <h3 class="font-headline font-bold text-on-surface mb-4">Ações rápidas</h3>
+        <div class="grid grid-cols-2 gap-3">
+          <?php
+          $acoes = [
+            ['icon'=>'add_circle',   'label'=>'Agendar',     'href'=>'agendar.php',   'cor'=>'text-primary'],
+            ['icon'=>'history',      'label'=>'Histórico',   'href'=>'#hist-lista',   'cor'=>'text-indigo-600'],
+            ['icon'=>'campaign',     'label'=>'Avisos',      'href'=>'#avisos',       'cor'=>'text-primary'],
+            ['icon'=>'rate_review',  'label'=>'Sugestão',    'href'=>'#sugestao',     'cor'=>'text-emerald-600'],
+          ];
+          foreach ($acoes as $a): ?>
+          <a href="<?= $a['href'] ?>"
+            class="glass flex flex-col items-center gap-2 p-4 rounded-2xl border border-outline-variant/20 hover:border-primary/30 hover:bg-primary/4 transition-all group">
+            <span class="material-symbols-outlined text-2xl <?= $a['cor'] ?> group-hover:scale-110 transition-transform"><?= $a['icon'] ?></span>
+            <span class="text-xs font-medium text-on-surface"><?= $a['label'] ?></span>
+          </a>
+          <?php endforeach; ?>
+        </div>
+      </div>
+
+      <!-- Caixa de sugestões / reclamações -->
+      <div id="sugestao" class="glass rounded-2xl p-5 border border-outline-variant/20">
+        <div class="flex items-center gap-2 mb-4">
+          <span class="material-symbols-outlined text-emerald-600">rate_review</span>
+          <h3 class="font-headline font-bold text-on-surface">Fale com a coordenação</h3>
+        </div>
+
+        <form id="form-sugestao" class="space-y-3" onsubmit="enviarSugestao(event)">
+          <select id="sug-tipo" class="w-full rounded-xl border border-outline-variant/30 bg-white/60 px-3 py-2.5 text-sm text-on-surface focus:ring-2 focus:ring-primary focus:border-primary transition-all">
+            <option value="sugestao">💡 Sugestão</option>
+            <option value="elogio">👏 Elogio</option>
+            <option value="reclamacao">⚠️ Reclamação</option>
+            <option value="duvida">❓ Dúvida</option>
+          </select>
+          <textarea id="sug-msg" rows="3" maxlength="600"
+            placeholder="Escreva sua mensagem..."
+            class="w-full rounded-xl border border-outline-variant/30 bg-white/60 px-3 py-2.5 text-sm text-on-surface placeholder:text-on-surface-variant/40 focus:ring-2 focus:ring-primary focus:border-primary resize-none transition-all"></textarea>
+          <div id="sug-erro" class="hidden text-xs text-error font-medium flex items-center gap-1">
+            <span class="material-symbols-outlined text-sm">error</span><span id="sug-erro-msg"></span>
+          </div>
+          <button type="submit"
+            class="w-full py-3 rounded-full bg-emerald-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+            <span class="material-symbols-outlined text-sm">send</span>
+            <span id="sug-btn-label">Enviar mensagem</span>
+          </button>
+        </form>
+
+        <!-- Minhas últimas mensagens -->
+        <?php if (!empty($minhas_sug)): ?>
+        <div class="mt-5 pt-4 border-t border-outline-variant/20 space-y-2.5">
+          <p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant">Minhas mensagens</p>
+          <?php foreach ($minhas_sug as $sg):
+            $tipo_icon = ['sugestao'=>'💡','elogio'=>'👏','reclamacao'=>'⚠️','duvida'=>'❓'][$sg['tipo']] ?? '📝';
+          ?>
+          <div class="bg-white/60 rounded-xl p-3 border border-outline-variant/20">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold text-on-surface"><?= $tipo_icon ?> <?= ucfirst($sg['tipo']) ?></span>
+              <span class="text-[10px] text-outline"><?= date('d/m/Y', strtotime($sg['criado_em'])) ?></span>
+            </div>
+            <p class="text-xs text-on-surface-variant leading-relaxed truncate"><?= htmlspecialchars($sg['mensagem']) ?></p>
+            <?php if ($sg['resposta']): ?>
+            <div class="mt-2 pl-3 border-l-2 border-emerald-400">
+              <p class="text-xs font-bold text-emerald-700">Resposta da coordenação:</p>
+              <p class="text-xs text-emerald-800 mt-0.5"><?= htmlspecialchars($sg['resposta']) ?></p>
+            </div>
+            <?php elseif (!$sg['lida']): ?>
+            <span class="inline-block mt-1.5 text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">Aguardando leitura</span>
+            <?php else: ?>
+            <span class="inline-block mt-1.5 text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700">Lida</span>
+            <?php endif; ?>
+          </div>
+          <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+      </div>
+
+      <!-- Projeto NUPICS -->
+      <div class="bg-gradient-to-br from-primary to-secondary p-7 rounded-2xl text-white relative overflow-hidden">
+        <div class="relative z-10 space-y-4">
+          <h3 class="text-xl font-extrabold">NUPICS Caicó</h3>
+          <p class="text-purple-100 text-sm leading-relaxed">
+            Projeto de extensão da UERN, oferecendo atendimentos integrativos gratuitos para toda a comunidade.
+          </p>
+          <p class="text-purple-200 text-xs">Campus UERN, Caicó/RN</p>
+        </div>
+        <span class="material-symbols-outlined absolute -bottom-4 -right-4 text-[100px] text-white/10">eco</span>
+      </div>
+
+    </div><!-- /coluna direita -->
+  </div><!-- /grid principal -->
 
 </main>
 
-<!-- FOOTER -->
-<footer class="py-8 px-8" style="background:#f7eaf8">
-  <div class="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center gap-3 text-xs text-gray-400">
-    <span class="font-extrabold text-purple-900 text-sm headline">NUPICS — UERN</span>
-    <span>© <?= date('Y') ?> NUPICS — Saúde Integrativa e Bem-estar.</span>
-  </div>
-</footer>
-
-<!-- MODAIS DAS PRÁTICAS -->
-<?php foreach ($praticas as $pr): ?>
-<div class="pratica-modal" id="modal-<?= $pr['id'] ?>">
-  <div class="bg-white rounded-3xl w-full max-w-lg max-h-[92vh] flex flex-col overflow-hidden shadow-2xl">
-    <div class="flex items-center justify-between px-6 pt-5 pb-4 border-b border-gray-100">
-      <div>
-        <h3 class="text-base font-extrabold headline text-purple-900"><?= $pr['titulo'] ?></h3>
-        <p class="text-xs text-gray-400 mt-0.5"><?= $pr['duracao'] ?> · <?= $pr['musica']['nome'] ?></p>
-      </div>
-      <button onclick="fecharPratica('<?= $pr['id'] ?>')"
-              class="w-8 h-8 rounded-full bg-gray-100 hover:bg-gray-200 flex items-center justify-center text-gray-500">✕</button>
-    </div>
-
-    <div class="px-6 py-3 border-b border-gray-50" style="background:#fdeffe">
-      <div class="flex items-center gap-3">
-        <button onclick="togglePraticaPlayer('<?= $pr['id'] ?>','<?= $pr['musica']['url'] ?>')"
-                id="btn-pratica-<?= $pr['id'] ?>"
-                class="w-9 h-9 rounded-full text-white flex items-center justify-center flex-shrink-0 grad hover:opacity-90">
-          <span class="material-symbols-outlined" style="font-size:18px;font-variation-settings:'FILL' 1">play_arrow</span>
-        </button>
-        <div class="flex-1">
-          <p class="text-xs font-bold text-purple-900"><?= $pr['musica']['nome'] ?></p>
-          <div class="h-1 bg-gray-200 rounded-full mt-1"><div class="player-prog" style="width:0%"></div></div>
-        </div>
-        <span class="material-symbols-outlined text-purple-300" style="font-size:18px">headphones</span>
-      </div>
-      <div class="hidden mt-2 rounded-xl overflow-hidden" id="yt-pratica-<?= $pr['id'] ?>">
-        <iframe width="100%" height="72" frameborder="0" allow="autoplay;encrypted-media"
-                id="frame-pratica-<?= $pr['id'] ?>" style="border-radius:8px"></iframe>
-      </div>
-    </div>
-
-    <div class="flex-1 overflow-y-auto px-6 py-4 space-y-2">
-      <?php foreach ($pr['passos'] as $idx => $passo): ?>
-      <div class="passo-item p-4 rounded-2xl cursor-pointer border border-transparent hover:border-purple-100 <?= $idx===0?'ativo':'' ?>"
-           onclick="ativarPasso(this)">
-        <div class="flex items-center gap-2 mb-1.5">
-          <span class="text-lg"><?= $passo['icone'] ?></span>
-          <span class="text-sm font-extrabold text-purple-900"><?= $passo['titulo'] ?></span>
-        </div>
-        <p class="text-sm text-gray-600 leading-relaxed whitespace-pre-line"><?= htmlspecialchars($passo['texto']) ?></p>
-      </div>
-      <?php endforeach; ?>
-    </div>
-
-    <div class="px-6 pb-5 pt-3 border-t border-gray-100">
-      <button onclick="fecharPratica('<?= $pr['id'] ?>')"
-              class="w-full py-3 grad text-white font-bold text-sm rounded-xl hover:opacity-90">
-        Concluir prática
+<!-- ═══════════════════════════════
+     MODAL: Detalhe da sessão
+═══════════════════════════════ -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-detalhe">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-detalhe')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 class="text-lg font-extrabold text-primary">Detalhes da Sessão</h2>
+      <button onclick="fecharModal('modal-detalhe')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors">
+        <span class="material-symbols-outlined text-base text-on-surface-variant">close</span>
       </button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-4">
+      <div id="det-banner" class="rounded-2xl px-4 py-3 flex items-center gap-3"></div>
+      <div class="grid gap-2.5">
+        <div class="flex items-center gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0">schedule</span>
+          <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Horário</p>
+               <p id="det-hora" class="font-bold text-sm text-on-surface"></p></div>
+        </div>
+        <div class="flex items-center gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0">person</span>
+          <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Terapeuta</p>
+               <p id="det-terapeuta" class="font-bold text-sm text-on-surface"></p></div>
+        </div>
+        <div class="flex items-center gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0">location_on</span>
+          <div><p class="text-[10px] font-bold uppercase text-on-surface-variant">Local</p>
+               <p id="det-local" class="font-bold text-sm text-on-surface"></p></div>
+        </div>
+        <div class="flex items-start gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0 mt-0.5">self_care</span>
+          <div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-1.5">Práticas</p>
+               <div id="det-praticas" class="flex flex-wrap gap-1.5"></div></div>
+        </div>
+      </div>
+      <div class="bg-surface-container-low rounded-2xl p-4 border border-outline-variant/15">
+        <p class="text-[10px] font-bold uppercase text-on-surface-variant mb-1.5">Suas queixas</p>
+        <p id="det-queixas" class="text-sm text-on-surface leading-relaxed"></p>
+      </div>
+      <div id="det-obs-wrap" class="hidden bg-indigo-50 rounded-2xl p-4 border border-indigo-100">
+        <p class="text-[10px] font-bold uppercase text-indigo-700 mb-1.5">Observação do terapeuta</p>
+        <p id="det-obs" class="text-sm text-indigo-900 leading-relaxed"></p>
+      </div>
+      <div id="det-cancelar-wrap" class="hidden">
+        <button id="btn-cancelar"
+          class="w-full py-3.5 rounded-full border-2 border-red-200 text-red-600 font-bold text-sm hover:bg-red-50 transition-all flex items-center justify-center gap-2">
+          <span class="material-symbols-outlined text-sm">cancel</span>Cancelar este agendamento
+        </button>
+      </div>
     </div>
   </div>
 </div>
-<?php endforeach; ?>
+
+<!-- MODAL: Confirmar cancelamento -->
+<div class="modal-wrap fixed inset-0 z-[101] items-center justify-center p-4" id="modal-cancelar">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-cancelar')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-8 text-center">
+    <div class="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mx-auto mb-5">
+      <span class="material-symbols-outlined text-4xl">event_busy</span>
+    </div>
+    <h2 class="text-xl font-extrabold text-primary mb-2">Cancelar agendamento?</h2>
+    <p class="text-sm text-on-surface-variant mb-6 leading-relaxed">Esta ação não pode ser desfeita. Se mudar de ideia, você precisará agendar novamente.</p>
+    <div class="flex gap-3">
+      <button id="btn-cancelar-ok" class="flex-grow py-4 rounded-full bg-red-500 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all">Sim, cancelar</button>
+      <button onclick="fecharModal('modal-cancelar')" class="px-6 py-4 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm hover:bg-surface-container-high transition-all">Voltar</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════
+     MODAL: Guia de prática + YouTube
+═══════════════════════════════ -->
+<div class="modal-wrap fixed inset-0 z-[101] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-guia">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm" onclick="fecharModalGuia()"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-2xl rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[92vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-0.5">Sua prática</p>
+        <h2 id="guia-titulo" class="text-lg font-extrabold text-primary"></h2>
+      </div>
+      <button onclick="fecharModalGuia()" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors">
+        <span class="material-symbols-outlined text-base text-on-surface-variant">close</span>
+      </button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-5">
+      <!-- Instruções -->
+      <div class="bg-primary/5 rounded-2xl p-5 border border-primary/10">
+        <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-2">Passo a passo</p>
+        <p id="guia-texto" class="text-sm text-on-surface leading-relaxed"></p>
+      </div>
+      <!-- YouTube embed -->
+      <div>
+        <p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-3">Música para acompanhar</p>
+        <div class="flex flex-wrap gap-2 mb-3" id="guia-playlists"></div>
+        <div id="yt-container" class="hidden rounded-2xl overflow-hidden border border-outline-variant/20 aspect-video">
+          <iframe id="yt-frame" width="100%" height="100%" frameborder="0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowfullscreen class="w-full h-full"></iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: Playlist direto -->
+<div class="modal-wrap fixed inset-0 z-[101] items-center justify-center p-4" id="modal-playlist">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm" onclick="fecharModal('modal-playlist')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-2xl rounded-[2rem] shadow-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3">
+      <h2 id="playlist-titulo" class="text-lg font-extrabold text-primary"></h2>
+      <button onclick="fecharModal('modal-playlist')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors">
+        <span class="material-symbols-outlined text-base text-on-surface-variant">close</span>
+      </button>
+    </div>
+    <div class="aspect-video">
+      <iframe id="playlist-frame" width="100%" height="100%" frameborder="0"
+        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+        allowfullscreen class="w-full h-full"></iframe>
+    </div>
+    <div class="px-6 pb-5 pt-3">
+      <p class="text-xs text-on-surface-variant">Feche este modal para pausar a música.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] hidden pointer-events-none">
+  <div class="glass rounded-full px-5 py-3 flex items-center gap-2 shadow-xl">
+    <span id="toast-icon" class="material-symbols-outlined text-base"></span>
+    <span id="toast-msg" class="text-sm font-semibold text-on-surface"></span>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer class="py-10 bg-purple-50/50 border-t border-purple-200/20">
+  <div class="flex flex-col md:flex-row justify-between items-center px-8 max-w-7xl mx-auto text-sm text-purple-900">
+    <div class="mb-4 md:mb-0">
+      <span class="font-bold text-purple-800">NUPICS</span>
+      <p class="mt-1 text-purple-700/60">© <?= date('Y') ?> NUPICS – UERN Caicó</p>
+    </div>
+    <div class="flex gap-6">
+      <a href="#" class="text-purple-700 hover:text-pink-500 transition-colors">Privacidade</a>
+      <a href="#" class="text-purple-700 hover:text-pink-500 transition-colors">Contato</a>
+    </div>
+  </div>
+</footer>
 
 <script>
-var playlists = <?= json_encode(array_values($playlists)) ?>;
-var playlistIdx = 0;
-var playerAberto = false;
+const DIAS      = <?= json_encode($dias_nomes) ?>;
+const PLAYLISTS = <?= json_encode(array_map(fn($p) => [
+  'nome' => $p['nome'], 'emoji' => $p['emoji'],
+  'ytId' => preg_match('/(?:v=|youtu\.be\/)([A-Za-z0-9_\-]{11})/', $p['url'], $m) ? $m[1] : ''
+], $playlists)) ?>;
 
-function togglePlayer() {
-  var c = document.getElementById('yt-container');
-  var f = document.getElementById('yt-frame');
-  var b = document.getElementById('btn-play');
-  if (!playerAberto) {
-    var url = playlists[playlistIdx].url;
-    var vid = url.match(/(?:v=|youtu\.be\/)([^&\s]+)/);
-    if (vid) {
-      f.src = 'https://www.youtube.com/embed/' + vid[1] + '?autoplay=1';
-      c.classList.remove('hidden');
-      b.innerHTML = '<span class="material-symbols-outlined" style="font-variation-settings:\'FILL\' 1">pause</span>';
-      playerAberto = true;
-    }
-  } else {
-    f.src = ''; c.classList.add('hidden');
-    b.innerHTML = '<span class="material-symbols-outlined" style="font-variation-settings:\'FILL\' 1">play_arrow</span>';
-    playerAberto = false;
-  }
+const GUIAS = <?= json_encode($guias) ?>;
+const RECS  = <?= json_encode($recomendacoes) ?>;
+
+// ── Mobile nav ──────────────────────────────────
+document.getElementById('mob-btn').addEventListener('click', () =>
+  document.getElementById('mob-menu').classList.toggle('hidden'));
+
+// ── Modal helpers ───────────────────────────────
+function abrirModal(id)  { document.getElementById(id).classList.add('open'); document.body.style.overflow='hidden'; }
+function fecharModal(id) { document.getElementById(id).classList.remove('open'); document.body.style.overflow=''; }
+function fecharModalGuia() {
+  document.getElementById('yt-frame').src = '';
+  fecharModal('modal-guia');
 }
 
-function mudarPlaylist(dir) {
-  playlistIdx = (playlistIdx + dir + playlists.length) % playlists.length;
-  document.getElementById('ambiente-nome').textContent = playlists[playlistIdx].nome || playlists[playlistIdx].emoji + ' ' + playlists[playlistIdx].nome;
-  if (playerAberto) { playerAberto = false; togglePlayer(); }
-}
-
-function selecionarPlaylist(idx) {
-  playlistIdx = idx;
-  var p = playlists[idx];
-  document.getElementById('ambiente-nome').textContent = (p.emoji||'') + ' ' + p.nome;
-  document.querySelectorAll('.playlist-btn').forEach(function(b, i) {
-    b.style.background  = i===idx ? '#4e0078' : '';
-    b.style.color       = i===idx ? 'white'   : '#4d4351';
-    b.style.borderColor = i===idx ? '#4e0078' : '#d0c2d3';
+// ── Tabs histórico ──────────────────────────────
+document.querySelectorAll('[data-tab-h]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-tab-h]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const filtro = btn.dataset.tabH;
+    let vis = 0;
+    document.querySelectorAll('.hist-item').forEach(it => {
+      const show = filtro==='todas' || it.dataset.status===filtro;
+      it.classList.toggle('hidden', !show);
+      if (show) vis++;
+    });
+    document.getElementById('hist-vazio').classList.toggle('hidden', vis > 0);
   });
-  if (playerAberto) { playerAberto = false; togglePlayer(); }
-}
-
-var sugestoes = {
-  'Bem':           ['Meditação Breve',        'Para aprofundar sua paz interior.',                    'meditacao'],
-  'Neutro':        ['Respiração Guiada',      'Para trazer mais presença ao momento.',                'respiracao'],
-  'Cansado':       ['Escalda-pés Relaxante',  'Para aliviar o peso do corpo e da mente.',             'escalda'],
-  'Ansioso':       ['Aterramento (Ansiedade)','Técnica 5-4-3-2-1 para o momento presente.',           'aterramento'],
-  'Sobrecarregado':['Relaxamento Rápido',     'Pause por 3 minutos e recentre-se.',                   'estresse'],
-  'Triste':        ['Meditação Breve',        'Um espaço seguro para observar seus sentimentos.',     'meditacao'],
-};
-
-function selecionarEmocao(btn, emocao) {
-  var sug = sugestoes[emocao] || ['Respiração Guiada','Para cuidar de você agora.','respiracao'];
-  document.getElementById('sugestao-titulo').textContent = 'Sugerimos: ' + sug[0];
-  document.getElementById('sugestao-desc').textContent   = sug[1];
-  document.querySelector('#sugestao-desc').closest('div').querySelector('button').onclick = function(){abrirPratica(sug[2]);};
-}
-
-var praticaFrames = {};
-function abrirPratica(id) {
-  document.getElementById('modal-' + id).classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-function fecharPratica(id) {
-  document.getElementById('modal-' + id).classList.remove('open');
-  document.body.style.overflow = '';
-  var f = document.getElementById('frame-pratica-' + id);
-  if (f) f.src = '';
-  var y = document.getElementById('yt-pratica-' + id);
-  if (y) y.classList.add('hidden');
-  praticaFrames[id] = false;
-}
-function togglePraticaPlayer(id, url) {
-  var f = document.getElementById('frame-pratica-' + id);
-  var y = document.getElementById('yt-pratica-' + id);
-  var b = document.getElementById('btn-pratica-' + id);
-  if (!praticaFrames[id]) {
-    var vid = url.match(/(?:v=|youtu\.be\/)([^&\s]+)/);
-    if (vid) {
-      f.src = 'https://www.youtube.com/embed/' + vid[1] + '?autoplay=1';
-      y.classList.remove('hidden');
-      b.innerHTML = '<span class="material-symbols-outlined" style="font-size:18px;font-variation-settings:\'FILL\' 1">pause</span>';
-      praticaFrames[id] = true;
-    }
-  } else {
-    f.src = ''; y.classList.add('hidden');
-    b.innerHTML = '<span class="material-symbols-outlined" style="font-size:18px;font-variation-settings:\'FILL\' 1">play_arrow</span>';
-    praticaFrames[id] = false;
-  }
-}
-function ativarPasso(el) {
-  el.closest('.flex-1').querySelectorAll('.passo-item').forEach(function(p){ p.classList.remove('ativo'); });
-  el.classList.add('ativo');
-}
-document.querySelectorAll('.pratica-modal').forEach(function(m) {
-  m.addEventListener('click', function(e){ if(e.target===m) fecharPratica(m.id.replace('modal-','')); });
 });
-</script>
 
+// ── Check-in emocional ──────────────────────────
+let humorAtual = null;
+document.querySelectorAll('.humor-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.humor-btn').forEach(b => b.classList.remove('selecionado'));
+    btn.classList.add('selecionado');
+    humorAtual = btn.dataset.humor;
+    const rec = RECS[humorAtual];
+    if (!rec) return;
+    const box = document.getElementById('recomendacao-box');
+    box.className = `rounded-2xl p-5 flex items-center gap-5 transition-all ${rec.bg} border border-current/10`;
+    document.getElementById('rec-icon-wrap').className = `p-3 rounded-full shrink-0 ${rec.bg}`;
+    document.getElementById('rec-icon').className = `material-symbols-outlined text-2xl ${rec.cor}`;
+    document.getElementById('rec-icon').textContent = rec.icon;
+    document.getElementById('rec-titulo').textContent = rec.titulo;
+    document.getElementById('rec-desc').textContent   = rec.desc;
+    box.classList.remove('hidden');
+  });
+});
+
+// ── Modal Guia ──────────────────────────────────
+function abrirGuia() {
+  if (!humorAtual) return;
+  const rec   = RECS[humorAtual];
+  const guia  = GUIAS[humorAtual];
+  document.getElementById('guia-titulo').textContent = rec.titulo;
+  document.getElementById('guia-texto').textContent  = guia;
+
+  // Monta pills de playlists
+  const pp = document.getElementById('guia-playlists');
+  pp.innerHTML = '';
+  PLAYLISTS.forEach(pl => {
+    if (!pl.ytId) return;
+    const b = document.createElement('button');
+    b.className = 'flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-outline-variant/30 bg-white/60 hover:border-primary/40 hover:bg-primary/5 text-xs font-medium text-on-surface transition-all';
+    b.innerHTML = `${pl.emoji} ${pl.nome} <span class="material-symbols-outlined text-xs text-primary/60">play_circle</span>`;
+    b.onclick = () => embedYT(pl.ytId);
+    pp.appendChild(b);
+  });
+
+  // Auto-carrega a primeira playlist
+  if (PLAYLISTS.length && PLAYLISTS[0].ytId) embedYT(PLAYLISTS[0].ytId);
+  abrirModal('modal-guia');
+}
+
+function embedYT(ytId) {
+  const c = document.getElementById('yt-container');
+  document.getElementById('yt-frame').src = `https://www.youtube.com/embed/${ytId}?autoplay=1`;
+  c.classList.remove('hidden');
+}
+
+// ── Playlist direta ─────────────────────────────
+function abrirPlaylist(ytId, nome) {
+  document.getElementById('playlist-titulo').textContent = nome;
+  document.getElementById('playlist-frame').src = `https://www.youtube.com/embed/${ytId}?autoplay=1`;
+  abrirModal('modal-playlist');
+}
+// Para ao fechar
+document.getElementById('modal-playlist').addEventListener('click', e => {
+  if (e.target === e.currentTarget) document.getElementById('playlist-frame').src = '';
+});
+
+// ── Detalhe da sessão ───────────────────────────
+let ridAtual = null;
+function abrirDetalhe(r) {
+  ridAtual = r.id;
+  const hi = r.hora_inicio?.substring(0,5), hf = r.hora_fim?.substring(0,5);
+  const dia = DIAS[r.dia_semana]||'?';
+  const dt  = r.data_sessao ? new Date(r.data_sessao+'T00:00').toLocaleDateString('pt-BR') : '';
+
+  const cfg = {
+    pendente:   {bg:'bg-primary/8 border border-primary/15',  ic:'pending',        cor:'text-primary',     txt:'Aguardando confirmação'},
+    confirmado: {bg:'bg-emerald-50 border border-emerald-100',ic:'event_available', cor:'text-emerald-600', txt:'Sessão confirmada!'},
+    cancelado:  {bg:'bg-red-50 border border-red-100',        ic:'event_busy',      cor:'text-red-500',     txt:'Agendamento cancelado'},
+    concluido:  {bg:'bg-indigo-50 border border-indigo-100',  ic:'verified',        cor:'text-indigo-600',  txt:'Sessão realizada'},
+  }[r.status] || {};
+  const banner = document.getElementById('det-banner');
+  banner.className = `rounded-2xl px-4 py-3 flex items-center gap-3 ${cfg.bg||''}`;
+  banner.innerHTML = `<span class="material-symbols-outlined ${cfg.cor||''}">${cfg.ic||''}</span><span class="text-sm font-bold ${cfg.cor||''}">${cfg.txt||''}</span>`;
+
+  document.getElementById('det-hora').textContent      = `${dia}, ${dt} • ${hi} – ${hf}`;
+  document.getElementById('det-terapeuta').textContent = r.terapeuta_nome||'—';
+  document.getElementById('det-local').textContent     = r.local||'A definir';
+  document.getElementById('det-queixas').textContent   = r.queixas||'—';
+
+  const pp = document.getElementById('det-praticas');
+  pp.innerHTML='';
+  (r.praticas||'').split(',').forEach(p => {
+    if (!p.trim()) return;
+    const s = document.createElement('span');
+    s.className='px-3 py-1 rounded-full bg-primary/10 text-primary text-xs font-bold';
+    s.textContent=p.trim(); pp.appendChild(s);
+  });
+
+  const obsW = document.getElementById('det-obs-wrap');
+  if (r.status==='concluido' && r.observacao) {
+    document.getElementById('det-obs').textContent = r.observacao;
+    obsW.classList.remove('hidden');
+  } else obsW.classList.add('hidden');
+
+  document.getElementById('det-cancelar-wrap').classList.toggle('hidden',
+    !['pendente','confirmado'].includes(r.status));
+
+  abrirModal('modal-detalhe');
+}
+
+// ── Cancelar sessão ─────────────────────────────
+document.getElementById('btn-cancelar').addEventListener('click', () => {
+  fecharModal('modal-detalhe');
+  setTimeout(() => abrirModal('modal-cancelar'), 150);
+});
+document.getElementById('btn-cancelar-ok').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-cancelar-ok');
+  btn.disabled=true; btn.textContent='...';
+  const form = new FormData();
+  form.append('acao','cancelar'); form.append('reserva_id', ridAtual);
+  try {
+    const data = await fetch('../api/reserva_action.php',{method:'POST',body:form}).then(r=>r.json());
+    fecharModal('modal-cancelar');
+    if (data.ok) { toast('Agendamento cancelado.','event_busy','text-red-500'); setTimeout(()=>location.reload(),1200); }
+    else toast(data.msg||'Erro.','error','text-red-500');
+  } catch { toast('Erro de conexão.','error','text-red-500'); }
+  finally { btn.disabled=false; btn.textContent='Sim, cancelar'; }
+});
+
+// ── Sugestão / reclamação ───────────────────────
+async function enviarSugestao(e) {
+  e.preventDefault();
+  const tipo = document.getElementById('sug-tipo').value;
+  const msg  = document.getElementById('sug-msg').value.trim();
+  const erro = document.getElementById('sug-erro');
+  const erroMsg = document.getElementById('sug-erro-msg');
+  const btnLabel = document.getElementById('sug-btn-label');
+
+  erro.classList.add('hidden');
+  if (!msg || msg.length < 10) {
+    erroMsg.textContent='Escreva ao menos 10 caracteres.'; erro.classList.remove('hidden'); return;
+  }
+
+  btnLabel.textContent='Enviando...';
+  const form = new FormData();
+  form.append('acao','sugestao'); form.append('tipo', tipo); form.append('mensagem', msg);
+
+  try {
+    const data = await fetch('../api/reserva_action.php',{method:'POST',body:form}).then(r=>r.json());
+    if (data.ok) {
+      document.getElementById('sug-msg').value='';
+      toast('Mensagem enviada! 👍','check_circle','text-emerald-600');
+      setTimeout(()=>location.reload(),1500);
+    } else { erroMsg.textContent=data.msg||'Erro ao enviar.'; erro.classList.remove('hidden'); }
+  } catch { erroMsg.textContent='Erro de conexão.'; erro.classList.remove('hidden'); }
+  finally { btnLabel.textContent='Enviar mensagem'; }
+}
+
+// ── Toast ───────────────────────────────────────
+function toast(msg, icon='check_circle', cor='text-emerald-600') {
+  const t = document.getElementById('toast');
+  document.getElementById('toast-msg').textContent=msg;
+  const ic=document.getElementById('toast-icon'); ic.textContent=icon; ic.className='material-symbols-outlined text-base '+cor;
+  t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),3000);
+}
+</script>
 </body>
 </html>

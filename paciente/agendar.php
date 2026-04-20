@@ -1,428 +1,507 @@
 <?php
 session_start();
-require_once '../config/db.php';
-
 if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'paciente') {
     header('Location: ../index.php'); exit;
 }
+require_once '../config/db.php';
 
-$uid = (int)$_SESSION['usuario_id'];
-$stmt = $pdo->prepare('SELECT id FROM pacientes WHERE usuario_id = ?');
-$stmt->execute([$uid]);
-$paciente = $stmt->fetch();
-if (!$paciente) { header('Location: ../index.php'); exit; }
-$pid = $paciente['id'];
+$uid         = (int)$_SESSION['usuario_id'];
+$nome_paciente = $_SESSION['nome'];
 
-// ── Ciclo ativo ──
-$stmt = $pdo->prepare('
-    SELECT c.id, c.total_sessoes,
-           COUNT(CASE WHEN a.status = "agendado" AND a.data >= CURDATE() THEN 1 END) AS proximas
-    FROM ciclos c
-    LEFT JOIN agendamentos a ON a.ciclo_id = c.id
-    WHERE c.paciente_id = ? AND c.status = "ativo"
-    GROUP BY c.id LIMIT 1
-');
-$stmt->execute([$pid]);
-$ciclo_existente = $stmt->fetch();
-$bloqueado = $ciclo_existente && $ciclo_existente['proximas'] > 0;
+// Busca o telefone do paciente para pré-preencher o campo
+$tel_stmt = $pdo->prepare("SELECT telefone FROM usuarios WHERE id = ?");
+$tel_stmt->execute([$uid]);
+$telefone_cadastrado = $tel_stmt->fetchColumn() ?? '';
 
-$sucesso = '';
-$erro    = '';
-$datas_confirmadas = [];
+// Busca slots ativos com vagas calculadas para a próxima ocorrência de cada dia
+$slots_raw = $pdo->query("
+    SELECT
+        s.id, s.dia_semana, s.hora_inicio, s.hora_fim,
+        s.local, s.praticas, s.vagas_total,
+        u.nome  AS terapeuta_nome,
+        t.especialidade,
+        s.vagas_total - IFNULL((
+            SELECT COUNT(*)
+            FROM reservas r
+            WHERE r.slot_id   = s.id
+              AND r.status    NOT IN ('cancelado')
+              AND r.data_sessao = DATE_ADD(CURDATE(),
+                    INTERVAL MOD(s.dia_semana - 1 - WEEKDAY(CURDATE()) + 7, 7) DAY)
+        ), 0) AS vagas_disponiveis,
+        DATE_FORMAT(
+            DATE_ADD(CURDATE(),
+                INTERVAL MOD(s.dia_semana - 1 - WEEKDAY(CURDATE()) + 7, 7) DAY),
+            '%d/%m/%Y'
+        ) AS data_exibicao
+    FROM slots s
+    JOIN   usuarios   u ON s.terapeuta_id = u.id
+    LEFT JOIN terapeutas t ON t.usuario_id = u.id
+    WHERE s.ativo = 1
+    ORDER BY s.dia_semana, s.hora_inicio
+")->fetchAll(PDO::FETCH_ASSOC);
 
-// ── Processar agendamento ──
-if (!$bloqueado && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['horario_id'])) {
-    $horario_id = (int)$_POST['horario_id'];
-    if (!$horario_id) {
-        $erro = 'Selecione um horário.';
-    } else {
-        $hcheck = $pdo->prepare('SELECT * FROM horarios WHERE id = ? AND ativo = 1');
-        $hcheck->execute([$horario_id]);
-        $horario = $hcheck->fetch();
-
-        if (!$horario) {
-            $erro = 'Horário inválido.';
-        } else {
-            $dia_semana = $horario['dia_semana'];
-            $hoje = new DateTime('today');
-            $hoje->modify('+1 day');
-            $data_inicio = null;
-            for ($i = 0; $i < 30; $i++) {
-                if ($hoje->format('N') == $dia_semana) { $data_inicio = clone $hoje; break; }
-                $hoje->modify('+1 day');
-            }
-            if (!$data_inicio) { $erro = 'Sem datas disponíveis.'; }
-            else {
-                $vq = $pdo->prepare('SELECT COUNT(*) FROM agendamentos WHERE horario_id=? AND data=? AND status="agendado"');
-                $vq->execute([$horario_id, $data_inicio->format('Y-m-d')]);
-                if ($vq->fetchColumn() >= $horario['vagas_total']) {
-                    $data_inicio->modify('+7 days');
-                    $vq->execute([$horario_id, $data_inicio->format('Y-m-d')]);
-                    if ($vq->fetchColumn() >= $horario['vagas_total']) { $erro = 'Sem vagas. Escolha outro horário.'; $data_inicio = null; }
-                }
-                if ($data_inicio && !$erro) {
-                    $ter = $pdo->prepare('SELECT terapeuta_id FROM horario_terapeutas WHERE horario_id=? LIMIT 1');
-                    $ter->execute([$horario_id]);
-                    $terapeuta_id = $ter->fetchColumn();
-                    $pdo->beginTransaction();
-                    $pdo->prepare('INSERT INTO ciclos(paciente_id,terapeuta_id,total_sessoes,status)VALUES(?,?,4,"ativo")')->execute([$pid,$terapeuta_id]);
-                    $ciclo_id = $pdo->lastInsertId();
-                    $dc = clone $data_inicio;
-                    for ($i = 1; $i <= 4; $i++) {
-                        $pdo->prepare('INSERT INTO agendamentos(ciclo_id,horario_id,data,numero_sessao,terapeuta_id,status)VALUES(?,?,?,?,?,"agendado")')->execute([$ciclo_id,$horario_id,$dc->format('Y-m-d'),$i,$terapeuta_id]);
-                        $datas_confirmadas[] = $dc->format('Y-m-d');
-                        $dc->modify('+7 days');
-                    }
-                    $pdo->commit();
-                    $sucesso = 'Agendamento confirmado!';
-                    $bloqueado = true;
-                    $_SESSION['agend_datas'] = $datas_confirmadas;
-                }
-            }
-        }
-    }
-}
-if ($sucesso) { $datas_confirmadas = $_SESSION['agend_datas'] ?? []; unset($_SESSION['agend_datas']); }
-
-// ── Horários por dia ──
-$horarios = $pdo->query('
-    SELECT h.id, h.dia_semana, h.hora_inicio, h.duracao_minutos, h.vagas_total,
-           GROUP_CONCAT(u.nome SEPARATOR ", ") AS terapeutas
-    FROM horarios h
-    JOIN horario_terapeutas ht ON ht.horario_id = h.id
-    JOIN terapeutas t ON t.id = ht.terapeuta_id AND t.ativo = 1
-    JOIN usuarios u ON u.id = t.usuario_id
-    WHERE h.ativo = 1
-    GROUP BY h.id ORDER BY h.dia_semana, h.hora_inicio
-')->fetchAll();
-
-$dias_info = [
-    '1'=>['nome'=>'Segunda','abrev'=>'Seg'],
-    '2'=>['nome'=>'Terça',  'abrev'=>'Ter'],
-    '3'=>['nome'=>'Quarta', 'abrev'=>'Qua'],
-    '4'=>['nome'=>'Quinta', 'abrev'=>'Qui'],
-    '5'=>['nome'=>'Sexta',  'abrev'=>'Sex'],
-];
-
-$por_dia = [];
-foreach ($horarios as $h) $por_dia[$h['dia_semana']][] = $h;
-
-function proxima_data_dia($dia) {
-    $hoje = new DateTime('today');
-    $hoje->modify('+1 day');
-    for ($i = 0; $i < 10; $i++) {
-        if ($hoje->format('N') == $dia) return clone $hoje;
-        $hoje->modify('+1 day');
-    }
-    return null;
+// Agrupa por dia_semana
+$dias_nomes = [1=>'Segunda',2=>'Terça',3=>'Quarta',4=>'Quinta',5=>'Sexta'];
+$slots_por_dia = [];
+foreach ($slots_raw as $s) {
+    $slots_por_dia[(int)$s['dia_semana']][] = $s;
 }
 ?>
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Agendar sessão — NUPICS</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
-  <style>
-    :root { --p:#4e0078; --s:#b7004d; }
-    * { box-sizing:border-box; }
-    body { font-family:'DM Sans',sans-serif; background:#faf7fc; margin:0; color:#2d1040; }
-    .hl { font-family:'Plus Jakarta Sans',sans-serif; }
-    .grad { background:linear-gradient(135deg,#4e0078,#b7004d); }
-    .grad-txt { background:linear-gradient(135deg,#4e0078,#b7004d); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-    .material-symbols-outlined { font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24; }
-
-    /* TOPNAV */
-    .topbar { position:sticky; top:0; z-index:50; background:rgba(250,247,252,.93); backdrop-filter:blur(14px); border-bottom:1px solid rgba(78,0,120,.08); padding:0 20px; height:54px; display:flex; align-items:center; justify-content:space-between; }
-
-    /* WEEK STRIP */
-    .week-strip { display:flex; background:white; border-radius:16px; border:1px solid rgba(78,0,120,.1); overflow:hidden; box-shadow:0 2px 14px rgba(78,0,120,.06); }
-    .day-pill { flex:1; padding:12px 6px; display:flex; flex-direction:column; align-items:center; gap:2px; cursor:pointer; border:none; background:transparent; border-right:1px solid rgba(78,0,120,.07); transition:background .15s; font-family:'DM Sans',sans-serif; }
-    .day-pill:last-child { border-right:none; }
-    .day-pill:hover:not(.empty) { background:#f5eeff; }
-    .day-pill.active { background:linear-gradient(135deg,#4e0078,#b7004d); }
-    .day-pill .abrev { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.07em; color:#9d7fb5; }
-    .day-pill.active .abrev { color:rgba(255,255,255,.7); }
-    .day-pill .dnum { font-size:20px; font-weight:800; font-family:'Plus Jakarta Sans',sans-serif; color:#2d1040; line-height:1.1; }
-    .day-pill.active .dnum { color:white; }
-    .day-pill .dcount { font-size:9px; font-weight:700; background:#f3eaff; color:#7c3aed; padding:1px 6px; border-radius:99px; margin-top:3px; }
-    .day-pill.active .dcount { background:rgba(255,255,255,.2); color:white; }
-    .day-pill.empty { opacity:.38; cursor:not-allowed; }
-
-    /* SLOT */
-    .slot-card { background:white; border-radius:14px; border:1.5px solid rgba(78,0,120,.08); padding:16px 18px; cursor:pointer; transition:all .18s; display:flex; align-items:flex-start; gap:14px; }
-    .slot-card:hover { border-color:#7c3aed; box-shadow:0 0 0 3px rgba(124,58,237,.07); transform:translateY(-1px); }
-    .slot-card.selected { border-color:#4e0078; background:linear-gradient(135deg,rgba(78,0,120,.03),rgba(183,0,77,.03)); box-shadow:0 0 0 3px rgba(78,0,120,.1); }
-    .slot-time { font-size:20px; font-weight:800; font-family:'Plus Jakarta Sans',sans-serif; color:#4e0078; min-width:96px; line-height:1; padding-top:2px; flex-shrink:0; }
-    .slot-time span { font-size:13px; font-weight:600; color:#9d7fb5; }
-    .slot-divider { width:1px; background:rgba(78,0,120,.1); align-self:stretch; flex-shrink:0; }
-    .slot-meta { flex:1; min-width:0; }
-    .slot-ter  { font-size:14px; font-weight:600; color:#2d1040; }
-    .slot-sub  { font-size:11px; color:#9d7fb5; margin-top:2px; }
-    .slot-date { font-size:12px; font-weight:700; color:#1D9E75; margin-top:5px; display:flex; align-items:center; gap:3px; }
-    .vaga-badge { flex-shrink:0; padding:4px 10px; border-radius:99px; font-size:11px; font-weight:700; background:#f3eaff; color:#4e0078; align-self:flex-start; margin-top:2px; }
-
-    /* PREVIEW */
-    .preview-box { max-height:0; overflow:hidden; transition:max-height .3s ease, opacity .25s; opacity:0; }
-    .preview-box.open { max-height:220px; opacity:1; }
-    .sdot { display:flex; align-items:center; gap:9px; padding:6px 0; font-size:13px; }
-    .snum { width:22px; height:22px; border-radius:50%; background:linear-gradient(135deg,#4e0078,#b7004d); color:white; font-size:9px; font-weight:800; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
-
-    /* BOTÃO CONFIRMAR */
-    .btn-confirm { width:100%; padding:15px; background:linear-gradient(135deg,#4e0078,#b7004d); color:white; font-size:15px; font-weight:800; border:none; border-radius:14px; cursor:pointer; font-family:'Plus Jakarta Sans',sans-serif; transition:opacity .15s; display:none; margin-top:16px; }
-    .btn-confirm.show { display:block; }
-    .btn-confirm:hover { opacity:.91; }
-
-    /* BLOQUEIO */
-    .bloqueio-card { background:linear-gradient(135deg,#4e0078,#b7004d); border-radius:20px; padding:22px 24px; color:white; }
-
-    /* REGRAS */
-    .ri { display:flex; align-items:flex-start; gap:11px; padding:13px 0; border-bottom:1px solid rgba(78,0,120,.06); font-size:13px; color:#4d3060; line-height:1.6; }
-    .ri:last-child { border-bottom:none; }
-    .ri-ico { width:28px; height:28px; border-radius:9px; display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; margin-top:1px; }
-
-    /* PAINEL DIA */
-    .dia-painel { display:none; }
-    .dia-painel.active { display:block; }
-
-    /* FOOTER */
-    footer { background:#f3eaff; padding:20px 24px; margin-top:40px; }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NUPICS | Agendar Sessão</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<script>
+  tailwind.config = {
+    darkMode:"class",
+    theme:{extend:{
+      colors:{
+        "surface":"#fff7fc","on-surface":"#201923","outline-variant":"#d0c2d3",
+        "surface-container-low":"#fdeffe","surface-container":"#f7eaf8",
+        "surface-container-high":"#f2e4f2","surface-container-highest":"#ecdeed",
+        "surface-container-lowest":"#ffffff","on-surface-variant":"#4d4351",
+        "primary":"#4e0078","on-primary":"#ffffff","primary-container":"#6a1b9a",
+        "secondary":"#b7004d","on-secondary":"#ffffff",
+        "error":"#ba1a1a","error-container":"#ffdad6","on-error-container":"#93000a",
+        "background":"#fff7fc","on-background":"#201923"
+      },
+      fontFamily:{"headline":["Plus Jakarta Sans"],"body":["Manrope"]}
+    }}
+  }
+</script>
+<style>
+  body { font-family:"Manrope",sans-serif }
+  h1,h2,h3,h4 { font-family:"Plus Jakarta Sans",sans-serif }
+  .material-symbols-outlined { font-variation-settings:"FILL" 0,"wght" 400,"GRAD" 0,"opsz" 24 }
+  .glass { background:rgba(255,255,255,.82); backdrop-filter:blur(20px) saturate(180%);
+           -webkit-backdrop-filter:blur(20px) saturate(180%); border:1px solid rgba(255,255,255,.45); }
+  .slot-btn.selected { border-color:#4e0078 !important; border-width:2px !important;
+                       background:rgba(78,0,120,.06) !important; box-shadow:0 4px 18px rgba(78,0,120,.12); }
+  .slot-btn.selected .slot-time { color:#4e0078 !important; font-weight:700; }
+  .modal-wrap { display:none; }
+  .modal-wrap.open { display:flex; animation:mfade .18s ease; }
+  @keyframes mfade { from{opacity:0} to{opacity:1} }
+  .modal-card { animation:mup .22s cubic-bezier(.22,1,.36,1); }
+  @keyframes mup { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+  textarea:focus,input:focus { outline:none; box-shadow:0 0 0 3px rgba(78,0,120,.15); }
+</style>
 </head>
-<body>
+<body class="bg-surface text-on-background min-h-screen flex flex-col">
 
-<!-- NAV -->
-<nav class="topbar">
-  <span class="text-base font-extrabold hl grad-txt">NUPICS</span>
-  <div class="flex items-center gap-3">
-    <a href="dashboard.php" class="flex items-center gap-1 text-sm font-semibold" style="color:#4e0078">
-      <span class="material-symbols-outlined" style="font-size:18px">arrow_back</span>
-      Voltar ao início
-    </a>
-    <a href="../api/logout.php" class="text-xs text-gray-400 border border-gray-200 rounded-full px-3 py-1">Sair</a>
+<!-- Nav -->
+<nav class="fixed top-0 w-full z-50 bg-white/60 backdrop-blur-md shadow-[0_4px_24px_rgba(32,25,35,.06)]">
+  <div class="flex justify-between items-center px-8 h-20 max-w-7xl mx-auto">
+    <span class="text-2xl font-bold bg-gradient-to-r from-purple-700 to-pink-600 bg-clip-text text-transparent font-['Plus_Jakarta_Sans']">NUPICS</span>
+    <div class="hidden md:flex items-center space-x-8">
+      <a href="dashboard.php" class="text-purple-700/70 hover:text-pink-600 transition-colors font-medium">Início</a>
+      <a href="meus_agendamentos.php" class="text-purple-700/70 hover:text-pink-600 transition-colors font-medium">Meus Agendamentos</a>
+      <a href="../logout.php" class="text-purple-800 font-semibold hover:text-pink-600 transition-colors">Sair</a>
+    </div>
   </div>
 </nav>
 
-<main class="max-w-2xl mx-auto px-4 py-7 space-y-5">
+<main class="flex-grow pt-32 pb-20 relative overflow-hidden">
+  <div class="absolute -top-40 -right-40 w-96 h-96 bg-primary/10 rounded-full blur-[100px] pointer-events-none"></div>
+  <div class="absolute top-1/2 -left-40 w-96 h-96 bg-secondary/10 rounded-full blur-[100px] pointer-events-none"></div>
 
-  <!-- TÍTULO -->
-  <div>
-    <h1 class="text-2xl font-extrabold hl grad-txt">Agendar sessão</h1>
-    <p class="text-sm mt-1" style="color:#9d7fb5">Escolha o dia e horário na grade semanal do NUPICS.</p>
-  </div>
+  <div class="max-w-7xl mx-auto px-6 relative z-10">
 
-  <?php if ($erro): ?>
-  <div style="background:#FBEAF0;color:#72243E;border:1px solid #f2b8cb;border-radius:12px;padding:12px 16px;font-size:13px;font-weight:600">
-    ⚠ <?= htmlspecialchars($erro) ?>
-  </div>
-  <?php endif; ?>
+    <!-- Header -->
+    <div class="mb-12">
+      <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight text-primary mb-4">Agendar sua Sessão</h1>
+      <p class="text-on-surface-variant max-w-2xl text-lg leading-relaxed">
+        Olá, <?= htmlspecialchars($nome_paciente) ?>! Escolha um horário disponível para sua próxima sessão.
+      </p>
+    </div>
 
-  <?php if ($sucesso): ?>
-  <!-- SUCESSO -->
-  <div style="background:white;border-radius:18px;border:1.5px solid #a3d9c5;padding:18px 22px">
-    <div class="flex items-center gap-3 mb-3">
-      <div class="w-10 h-10 rounded-full text-white flex items-center justify-center font-bold" style="background:linear-gradient(135deg,#1D9E75,#0F6E56)">✓</div>
-      <div>
-        <p class="font-extrabold hl" style="color:#085041">Agendamento confirmado!</p>
-        <p class="text-xs" style="color:#5a8a77">Suas 4 sessões foram criadas automaticamente.</p>
+    <!-- Stepper -->
+    <div class="mb-12 grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div class="flex items-center gap-4 bg-surface-container-highest/50 p-5 rounded-xl border border-primary/10">
+        <div class="w-10 h-10 rounded-full bg-primary flex items-center justify-center text-white font-bold shrink-0">1</div>
+        <div><p class="text-xs font-bold uppercase tracking-widest text-primary/60 mb-0.5">Passo atual</p>
+             <h3 class="font-headline font-bold text-on-surface">Dia e horário</h3></div>
+      </div>
+      <div class="flex items-center gap-4 bg-surface-container-low p-5 rounded-xl border border-outline-variant/10">
+        <div class="w-10 h-10 rounded-full bg-surface-container-highest flex items-center justify-center text-on-surface-variant font-bold shrink-0">2</div>
+        <div><p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant/60 mb-0.5">Próximo</p>
+             <h3 class="font-headline font-bold text-on-surface-variant">Revisão</h3></div>
+      </div>
+      <div class="flex items-center gap-4 bg-surface-container-low p-5 rounded-xl border border-outline-variant/10">
+        <div class="w-10 h-10 rounded-full bg-surface-container-highest flex items-center justify-center text-on-surface-variant font-bold shrink-0">3</div>
+        <div><p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant/60 mb-0.5">Finalização</p>
+             <h3 class="font-headline font-bold text-on-surface-variant">Confirmação</h3></div>
       </div>
     </div>
-    <?php if (!empty($datas_confirmadas)):
-      $dspt=['Mon'=>'Segunda','Tue'=>'Terça','Wed'=>'Quarta','Thu'=>'Quinta','Fri'=>'Sexta'];
-    ?>
-    <div style="padding-top:8px;border-top:1px solid #e0f5ec">
-      <?php foreach ($datas_confirmadas as $i=>$d):
-        $dt=new DateTime($d); $dow=$dspt[$dt->format('D')]??'';
-      ?>
-      <div class="sdot">
-        <div class="snum"><?= $i+1 ?></div>
-        <span style="font-weight:600;color:#2d1040"><?= $dow ?></span>
-        <span style="color:#9d7fb5"><?= $dt->format('d/m/Y') ?></span>
+
+    <!-- Grade de horários -->
+    <?php if (empty($slots_por_dia)): ?>
+      <div class="text-center py-20 text-on-surface-variant">
+        <span class="material-symbols-outlined text-5xl mb-3 block">event_busy</span>
+        <p class="text-lg font-medium">Nenhum horário disponível no momento.</p>
+      </div>
+    <?php else: ?>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-5 mb-10">
+      <?php foreach ([1,2,3,4,5] as $dia): ?>
+      <div class="bg-surface-container-lowest/70 backdrop-blur-xl p-5 rounded-xl shadow-[0_8px_32px_rgba(32,25,35,.06)] border border-white/40 flex flex-col min-h-[160px]">
+        <div class="mb-5 flex justify-between items-center">
+          <h4 class="font-headline font-bold text-primary text-lg"><?= $dias_nomes[$dia] ?></h4>
+          <span class="material-symbols-outlined text-secondary/50 text-sm">
+            <?= isset($slots_por_dia[$dia]) ? 'event_available' : 'event_busy' ?>
+          </span>
+        </div>
+
+        <?php if (!isset($slots_por_dia[$dia])): ?>
+          <div class="flex-grow flex flex-col items-center justify-center py-6 text-center">
+            <span class="material-symbols-outlined text-outline-variant text-3xl mb-1">remove_circle</span>
+            <p class="text-xs text-on-surface-variant font-medium">Sem horários</p>
+          </div>
+        <?php else: ?>
+          <div class="space-y-2.5 flex-grow">
+            <?php foreach ($slots_por_dia[$dia] as $slot):
+              $vagas = (int)$slot['vagas_disponiveis'];
+              $lotado = $vagas <= 0;
+              $praticasArr = array_map('trim', explode(',', $slot['praticas'] ?? ''));
+            ?>
+            <button
+              class="slot-btn w-full text-left p-3.5 rounded-xl border transition-all
+                     <?= $lotado
+                         ? 'border-outline-variant/20 hover:border-amber-400/60 hover:bg-amber-50/50'
+                         : 'border-outline-variant/20 hover:border-primary/40 hover:bg-primary/5' ?>"
+              data-slot-id="<?= $slot['id'] ?>"
+              data-dia="<?= $dias_nomes[$dia] ?>-feira"
+              data-data="<?= htmlspecialchars($slot['data_exibicao']) ?>"
+              data-hora="<?= substr($slot['hora_inicio'],0,5) ?> – <?= substr($slot['hora_fim'],0,5) ?>"
+              data-terapeuta="<?= htmlspecialchars($slot['terapeuta_nome']) ?>"
+              data-especialidade="<?= htmlspecialchars($slot['especialidade'] ?? 'Práticas Integrativas') ?>"
+              data-local="<?= htmlspecialchars($slot['local'] ?? '') ?>"
+              data-praticas="<?= htmlspecialchars($slot['praticas'] ?? '') ?>"
+              data-vagas="<?= $vagas ?>"
+              data-lotado="<?= $lotado ? '1' : '0' ?>">
+              <div class="flex justify-between items-center">
+                <span class="slot-time font-bold text-sm <?= $lotado ? 'text-on-surface-variant' : 'text-on-surface' ?>">
+                  <?= substr($slot['hora_inicio'],0,5) ?> – <?= substr($slot['hora_fim'],0,5) ?>
+                </span>
+                <div class="flex items-center gap-1.5">
+                  <?php if ($lotado): ?>
+                    <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                    <span class="text-[9px] font-bold text-amber-600 uppercase tracking-wide">Lotado</span>
+                  <?php else: ?>
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                    <span class="text-[9px] font-bold text-emerald-600 uppercase tracking-wide"><?= $vagas ?> vaga<?= $vagas>1?'s':'' ?></span>
+                  <?php endif; ?>
+                </div>
+              </div>
+              <?php if ($slot['terapeuta_nome']): ?>
+              <p class="text-[11px] text-on-surface-variant mt-1 truncate"><?= htmlspecialchars($slot['terapeuta_nome']) ?></p>
+              <?php endif; ?>
+            </button>
+            <?php endforeach; ?>
+          </div>
+        <?php endif; ?>
       </div>
       <?php endforeach; ?>
     </div>
     <?php endif; ?>
-  </div>
-  <div class="bloqueio-card">
-    <p class="font-extrabold hl text-lg mb-2">🔒 Agendamento bloqueado</p>
-    <p style="font-size:13px;opacity:.85">Você já possui sessões ativas. Não é possível criar um novo agendamento enquanto houver sessões pendentes.</p>
-    <p style="font-size:11px;opacity:.6;margin-top:8px">Quando seu ciclo for concluído, você poderá agendar novamente.</p>
-  </div>
-  <a href="dashboard.php" style="display:block;text-align:center;padding:14px;background:white;border:2px solid #4e0078;color:#4e0078;font-weight:800;border-radius:14px;font-family:'Plus Jakarta Sans',sans-serif;">
-    Ver minhas sessões
-  </a>
 
-  <?php elseif ($bloqueado): ?>
-  <!-- BLOQUEADO -->
-  <div class="bloqueio-card">
-    <p class="font-extrabold hl text-lg mb-2">🔒 Agendamento bloqueado</p>
-    <p style="font-size:13px;opacity:.85">Você já possui um ciclo de atendimento ativo com sessões agendadas. Não é possível criar um novo agendamento enquanto houver sessões pendentes.</p>
-    <p style="font-size:11px;opacity:.6;margin-top:10px">Quando seu ciclo atual for concluído, você poderá fazer um novo agendamento.</p>
-  </div>
-  <a href="dashboard.php" style="display:block;text-align:center;padding:14px;background:white;border:2px solid #4e0078;color:#4e0078;font-weight:800;border-radius:14px;font-family:'Plus Jakarta Sans',sans-serif;">
-    Ver minhas sessões
-  </a>
-
-  <?php else: ?>
-  <!-- PODE AGENDAR -->
-
-  <?php if (empty($por_dia)): ?>
-  <div style="text-align:center;padding:48px 16px;color:#9d7fb5;font-size:14px">
-    Nenhum horário disponível no momento.
-  </div>
-  <?php else: ?>
-
-  <!-- LINHA SEMANAL -->
-  <div class="week-strip">
-    <?php foreach ($dias_info as $num => $info):
-      $prx = proxima_data_dia($num);
-      $tem = isset($por_dia[$num]);
-      $qtd = $tem ? count($por_dia[$num]) : 0;
-    ?>
-    <button class="day-pill <?= !$tem?'empty':'' ?>"
-            id="pill-<?= $num ?>"
-            onclick="<?= $tem?"setDia('$num')":'' ?>"
-            type="button">
-      <span class="abrev"><?= $info['abrev'] ?></span>
-      <span class="dnum"><?= $prx ? $prx->format('d') : '—' ?></span>
-      <span class="dcount"><?= $tem ? "$qtd hor." : '—' ?></span>
-    </button>
-    <?php endforeach; ?>
-  </div>
-
-  <!-- FORM -->
-  <form method="POST" id="form-agend">
-    <input type="hidden" name="horario_id" id="input-horario" value="">
-
-    <?php foreach ($dias_info as $num => $info):
-      if (!isset($por_dia[$num])) continue;
-      $prx_dia = proxima_data_dia($num);
-    ?>
-    <div class="dia-painel space-y-3" id="painel-<?= $num ?>">
-      <p style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#9d7fb5;margin-bottom:2px">
-        <?= $info['nome'] ?> · <?= $prx_dia ? $prx_dia->format('d/m/Y') : '' ?>
-      </p>
-
-      <?php foreach ($por_dia[$num] as $h):
-        $hi = substr($h['hora_inicio'],0,5);
-        $hf = date('H:i',strtotime($h['hora_inicio'])+$h['duracao_minutos']*60);
-        $prx = proxima_data_dia($num);
-        $dp_arr = [];
-        if ($prx) {
-            $dp = clone $prx;
-            for ($i=0;$i<4;$i++) { $dp_arr[]=$dp->format('Y-m-d'); $dp->modify('+7 days'); }
-        }
-      ?>
-      <div class="slot-card" id="slot-<?= $h['id'] ?>"
-           onclick="selecionarSlot(<?= $h['id'] ?>, <?= json_encode($dp_arr) ?>)">
-
-        <div class="slot-time"><?= $hi ?><span> – <?= $hf ?></span></div>
-        <div class="slot-divider"></div>
-        <div class="slot-meta">
-          <div class="slot-ter"><?= htmlspecialchars($h['terapeutas']) ?></div>
-          <div class="slot-sub"><?= $h['duracao_minutos'] ?> min · <?= $h['vagas_total'] ?> vaga<?= $h['vagas_total']!=1?'s':'' ?></div>
-          <?php if ($prx): ?>
-          <div class="slot-date">
-            <span class="material-symbols-outlined" style="font-size:13px">event</span>
-            Próximo: <?= $prx->format('d/m') ?>
-          </div>
-          <?php endif; ?>
-
-          <!-- Preview -->
-          <div class="preview-box mt-3" id="preview-<?= $h['id'] ?>">
-            <p style="font-size:11px;font-weight:700;color:#4e0078;margin-bottom:6px">✓ Suas 4 sessões serão:</p>
-            <div id="preview-list-<?= $h['id'] ?>"></div>
-          </div>
-        </div>
-
-        <div class="vaga-badge"><?= $h['vagas_total'] ?> vaga<?= $h['vagas_total']!=1?'s':'' ?></div>
-      </div>
-      <?php endforeach; ?>
-    </div>
-    <?php endforeach; ?>
-
-    <button type="submit" class="btn-confirm" id="btn-confirmar">
-      Confirmar agendamento →
-    </button>
-  </form>
-
-  <?php endif; ?>
-  <?php endif; // fim não bloqueado ?>
-
-  <!-- COMO FUNCIONA -->
-  <div style="background:white;border-radius:18px;border:1px solid rgba(78,0,120,.08);padding:18px 20px;box-shadow:0 2px 10px rgba(78,0,120,.04)">
-    <p class="font-extrabold hl" style="font-size:13px;color:#4e0078;display:flex;align-items:center;gap:5px;margin-bottom:10px">
-      <span class="material-symbols-outlined" style="font-size:17px">help_outline</span>
-      Como funciona o agendamento
+    <!-- Hint -->
+    <p id="hint-bar" class="text-center text-on-surface-variant text-sm flex items-center justify-center gap-2">
+      <span class="material-symbols-outlined text-lg">touch_app</span>
+      Toque em um horário para iniciar o agendamento
     </p>
-    <div class="ri"><div class="ri-ico" style="background:#E1F5EE">📅</div><div><strong>1 ciclo por vez.</strong> Cada paciente realiza um ciclo de 4 sessões semanais. Enquanto houver sessões ativas, não é possível criar um novo agendamento.</div></div>
-    <div class="ri"><div class="ri-ico" style="background:#FAEEDA">⚠️</div><div><strong>Justificativa de falta:</strong> Você pode faltar com justificativa <strong>apenas uma vez</strong> por ciclo. Use o botão "Justificar falta" no seu painel com antecedência.</div></div>
-    <div class="ri"><div class="ri-ico" style="background:#FBEAF0">❌</div><div><strong>Falta sem aviso = sessão perdida.</strong> Se você faltar sem justificar, a sessão é descartada automaticamente pelo sistema — não depende do terapeuta.</div></div>
-    <div class="ri"><div class="ri-ico" style="background:#FBEAF0">🚫</div><div><strong>2 faltas = bloqueio.</strong> Duas faltas injustificadas encerram o ciclo e suspendem seu acesso a novos agendamentos.</div></div>
-    <div class="ri"><div class="ri-ico" style="background:#f4e8ff">🤖</div><div><strong>Remoção automática:</strong> A exclusão da agenda é feita pelo próprio sistema — o terapeuta não tem controle sobre isso.</div></div>
-  </div>
 
+  </div>
 </main>
 
-<!-- FOOTER -->
-<footer>
-  <div class="max-w-2xl mx-auto flex flex-col md:flex-row justify-between items-center gap-2">
-    <span class="font-extrabold hl" style="font-size:14px;color:#4e0078">NUPICS Caicó — UERN</span>
-    <span style="font-size:11px;color:#9d7fb5">Atendimentos integrativos gratuitos para a comunidade · Caicó/RN</span>
-    <a href="dashboard.php" style="font-size:12px;font-weight:700;color:#4e0078">← Voltar ao painel</a>
+<!-- ═══════════════════════════
+     MODAL: Revisão
+═══════════════════════════ -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-revisao">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm" id="overlay-rev"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-xl rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[92vh] overflow-hidden">
+
+    <div class="flex items-center justify-between px-7 pt-7 pb-4 shrink-0">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-0.5">Passo 2 de 3</p>
+        <h2 class="text-xl font-extrabold text-primary">Revisão do Agendamento</h2>
+      </div>
+      <button id="btn-fechar-rev" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors">
+        <span class="material-symbols-outlined text-lg text-on-surface-variant">close</span>
+      </button>
+    </div>
+
+    <div class="overflow-y-auto px-7 pb-7 flex-1 space-y-4">
+
+      <!-- Terapeuta -->
+      <div class="flex items-center gap-4 bg-primary/5 rounded-2xl p-4 border border-primary/10">
+        <div class="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center shrink-0">
+          <span class="material-symbols-outlined text-primary text-2xl">person</span>
+        </div>
+        <div>
+          <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-0.5">Terapeuta</p>
+          <p id="rev-terapeuta" class="font-bold text-on-surface text-base"></p>
+          <p id="rev-especialidade" class="text-sm text-on-surface-variant"></p>
+        </div>
+      </div>
+
+      <!-- Detalhes -->
+      <div class="grid gap-2">
+        <div class="flex items-center gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0 text-lg">schedule</span>
+          <div><p class="text-[11px] text-on-surface-variant font-bold uppercase tracking-wide">Horário</p>
+               <p id="rev-hora" class="font-bold text-on-surface text-sm"></p></div>
+        </div>
+        <div class="flex items-center gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0 text-lg">location_on</span>
+          <div><p class="text-[11px] text-on-surface-variant font-bold uppercase tracking-wide">Local</p>
+               <p id="rev-local" class="font-bold text-on-surface text-sm"></p></div>
+        </div>
+        <div class="flex items-start gap-3 bg-white/60 rounded-xl px-4 py-3 border border-outline-variant/20">
+          <span class="material-symbols-outlined text-secondary shrink-0 text-lg mt-0.5">self_care</span>
+          <div><p class="text-[11px] text-on-surface-variant font-bold uppercase tracking-wide mb-1.5">Práticas</p>
+               <div id="rev-praticas" class="flex flex-wrap gap-1.5"></div></div>
+        </div>
+      </div>
+
+      <!-- Aviso lotado -->
+      <div id="aviso-lotado" class="hidden flex items-start gap-3 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+        <span class="material-symbols-outlined text-amber-500 shrink-0 mt-0.5 text-lg">warning</span>
+        <div>
+          <p class="font-bold text-amber-800 text-sm">Este horário está lotado</p>
+          <p class="text-amber-700 text-sm mt-0.5">Você entrará na fila de espera e será notificado quando surgir uma vaga.</p>
+        </div>
+      </div>
+
+      <!-- Campo: queixas -->
+      <div>
+        <label class="block text-xs font-bold uppercase tracking-widest text-on-surface/60 mb-1.5" for="campo-queixas">
+          Descreva suas queixas <span class="text-secondary normal-case tracking-normal font-normal">(obrigatório)</span>
+        </label>
+        <textarea id="campo-queixas" rows="3"
+          placeholder="Ex: Dores lombares, estresse, dificuldade para dormir..."
+          class="w-full rounded-2xl border border-outline-variant/30 bg-white/60 px-4 py-3 text-sm text-on-surface placeholder:text-on-surface-variant/40 focus:ring-2 focus:ring-primary focus:border-primary resize-none transition-all"></textarea>
+      </div>
+
+      <!-- Campo: telefone -->
+      <div>
+        <label class="block text-xs font-bold uppercase tracking-widest text-on-surface/60 mb-1.5" for="campo-telefone">
+          Confirme seu telefone <span class="text-secondary normal-case tracking-normal font-normal">(obrigatório)</span>
+        </label>
+        <div class="relative">
+          <span class="absolute left-4 top-1/2 -translate-y-1/2">
+            <span class="material-symbols-outlined text-on-surface-variant text-lg">phone</span>
+          </span>
+          <input id="campo-telefone" type="tel"
+            placeholder="(84) 99999-9999"
+            class="w-full rounded-2xl border border-outline-variant/30 bg-white/60 pl-11 pr-4 py-3.5 text-sm text-on-surface placeholder:text-on-surface-variant/40 focus:ring-2 focus:ring-primary focus:border-primary transition-all"/>
+        </div>
+        <p class="text-xs text-on-surface-variant mt-1">Número cadastrado: <strong><?= htmlspecialchars($telefone_cadastrado ?: '(não informado)') ?></strong></p>
+      </div>
+
+      <!-- Erro -->
+      <div id="rev-erro" class="hidden flex items-center gap-2 bg-error-container text-on-error-container rounded-xl px-4 py-3 text-sm font-medium">
+        <span class="material-symbols-outlined text-base">error</span>
+        <span id="rev-erro-msg"></span>
+      </div>
+
+      <!-- Botões -->
+      <div class="flex flex-col sm:flex-row gap-3 pt-1">
+        <button id="btn-confirmar"
+          class="flex-grow py-4 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all shadow-lg flex items-center justify-center gap-2">
+          <span id="btn-label">Confirmar Agendamento</span>
+          <span class="material-symbols-outlined text-sm">check_circle</span>
+        </button>
+        <button id="btn-voltar"
+          class="px-7 py-4 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm hover:bg-surface-container-high transition-all">
+          Voltar
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════
+     MODAL: Sucesso
+═══════════════════════════ -->
+<div class="modal-wrap fixed inset-0 z-[101] items-center justify-center p-4" id="modal-sucesso">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-10 text-center">
+    <div id="suc-icon" class="w-20 h-20 bg-emerald-500/10 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-6">
+      <span class="material-symbols-outlined text-5xl">verified</span>
+    </div>
+    <h2 id="suc-titulo" class="text-2xl font-extrabold text-primary mb-3">Solicitação enviada!</h2>
+    <p id="suc-desc" class="text-on-surface-variant text-sm leading-relaxed mb-7"></p>
+    <div id="suc-resumo" class="bg-primary/5 rounded-2xl px-5 py-4 text-left mb-7 text-sm space-y-1.5 border border-primary/10"></div>
+    <button onclick="window.location.href='dashboard.php'"
+      class="w-full py-4 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90 transition-all shadow-xl">
+      Ir para o início
+    </button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════
+     MODAL: Fila de espera
+═══════════════════════════ -->
+<div class="modal-wrap fixed inset-0 z-[101] items-center justify-center p-4" id="modal-fila">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-10 text-center">
+    <div class="w-20 h-20 bg-amber-500/10 text-amber-500 rounded-full flex items-center justify-center mx-auto mb-6">
+      <span class="material-symbols-outlined text-5xl">queue</span>
+    </div>
+    <h2 class="text-2xl font-extrabold text-primary mb-3">Você está na fila!</h2>
+    <p id="fila-desc" class="text-on-surface-variant text-sm leading-relaxed mb-7"></p>
+    <button onclick="window.location.href='dashboard.php'"
+      class="w-full py-4 rounded-full bg-amber-500 text-white font-bold text-sm hover:opacity-90 transition-all shadow-xl">
+      Entendido
+    </button>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer class="py-10 bg-purple-50/50 border-t border-purple-200/20">
+  <div class="flex flex-col md:flex-row justify-between items-center px-10 max-w-7xl mx-auto text-sm text-purple-900">
+    <div class="mb-4 md:mb-0">
+      <span class="font-bold text-purple-800">NUPICS</span>
+      <p class="mt-1 text-purple-700/60">© <?= date('Y') ?> NUPICS – UERN Caicó</p>
+    </div>
+    <div class="flex gap-6">
+      <a href="#" class="text-purple-700 hover:text-pink-500 transition-colors">Privacidade</a>
+      <a href="#" class="text-purple-700 hover:text-pink-500 transition-colors">Termos</a>
+      <a href="#" class="text-purple-700 hover:text-pink-500 transition-colors">Contato</a>
+    </div>
   </div>
 </footer>
 
 <script>
-var diasDisponiveis = <?= json_encode(array_keys($por_dia)) ?>;
-var diasPt = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+const TEL_CADASTRADO = <?= json_encode($telefone_cadastrado) ?>;
+let slotAtual = null;
 
-// Ativa primeiro dia
-(function(){ if (diasDisponiveis.length) setDia(diasDisponiveis[0]); })();
+// ── Abrir modal ao clicar no slot ───────────────
+document.querySelectorAll('.slot-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    slotAtual = {
+      id:           btn.dataset.slotId,
+      dia:          btn.dataset.dia,
+      data:         btn.dataset.data,
+      hora:         btn.dataset.hora,
+      terapeuta:    btn.dataset.terapeuta,
+      especialidade:btn.dataset.especialidade,
+      local:        btn.dataset.local,
+      praticas:     btn.dataset.praticas,
+      lotado:       btn.dataset.lotado === '1'
+    };
 
-function setDia(num) {
-  document.querySelectorAll('.dia-painel').forEach(function(p){ p.classList.remove('active'); });
-  document.querySelectorAll('.day-pill').forEach(function(p){ p.classList.remove('active'); });
-  var pan = document.getElementById('painel-' + num);
-  var pil = document.getElementById('pill-'   + num);
-  if (pan) pan.classList.add('active');
-  if (pil) pil.classList.add('active');
-  // reseta slot
-  document.querySelectorAll('.slot-card').forEach(function(c){ c.classList.remove('selected'); });
-  document.querySelectorAll('.preview-box').forEach(function(p){ p.classList.remove('open'); });
-  document.getElementById('input-horario').value = '';
-  var btn = document.getElementById('btn-confirmar');
-  if (btn) btn.classList.remove('show');
-}
+    // Preenche modal
+    document.getElementById('rev-terapeuta').textContent    = slotAtual.terapeuta;
+    document.getElementById('rev-especialidade').textContent = slotAtual.especialidade;
+    document.getElementById('rev-hora').textContent = `${slotAtual.dia} ${slotAtual.data} • ${slotAtual.hora}`;
+    document.getElementById('rev-local').textContent = slotAtual.local || 'A definir';
 
-function selecionarSlot(hid, datas) {
-  document.querySelectorAll('.slot-card').forEach(function(c){ c.classList.remove('selected'); });
-  document.querySelectorAll('.preview-box').forEach(function(p){ p.classList.remove('open'); });
-  document.getElementById('slot-' + hid).classList.add('selected');
-  document.getElementById('input-horario').value = hid;
+    const pillBox = document.getElementById('rev-praticas');
+    pillBox.innerHTML = '';
+    (slotAtual.praticas || '').split(',').forEach(p => {
+      if (!p.trim()) return;
+      const s = document.createElement('span');
+      s.className = 'px-3 py-1 rounded-full bg-primary/10 text-primary text-xs font-bold';
+      s.textContent = p.trim(); pillBox.appendChild(s);
+    });
 
-  var list = document.getElementById('preview-list-' + hid);
-  list.innerHTML = '';
-  datas.forEach(function(d, i) {
-    var dt  = new Date(d + 'T12:00:00');
-    var dia = String(dt.getDate()).padStart(2,'0');
-    var mes = String(dt.getMonth()+1).padStart(2,'0');
-    var ano = dt.getFullYear();
-    var dow = diasPt[dt.getDay()];
-    var div = document.createElement('div');
-    div.className = 'sdot';
-    div.innerHTML = '<div class="snum">' + (i+1) + '</div><span style="font-weight:600;color:#2d1040">' + dow + '</span><span style="color:#9d7fb5">' + dia + '/' + mes + '/' + ano + '</span>';
-    list.appendChild(div);
+    document.getElementById('aviso-lotado').classList.toggle('hidden', !slotAtual.lotado);
+    document.getElementById('btn-label').textContent = slotAtual.lotado
+      ? 'Entrar na Fila de Espera' : 'Confirmar Agendamento';
+
+    // Pré-preenche telefone
+    document.getElementById('campo-telefone').value = TEL_CADASTRADO || '';
+    document.getElementById('campo-queixas').value  = '';
+    esconderErro();
+
+    // Highlight no botão
+    document.querySelectorAll('.slot-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    document.getElementById('hint-bar').style.display = 'none';
+
+    abrirModal('modal-revisao');
   });
+});
 
-  document.getElementById('preview-' + hid).classList.add('open');
-  var btn = document.getElementById('btn-confirmar');
-  if (btn) btn.classList.add('show');
-  setTimeout(function(){ if (btn) btn.scrollIntoView({behavior:'smooth',block:'nearest'}); }, 300);
+// ── Fechar ──────────────────────────────────────
+document.getElementById('btn-fechar-rev').addEventListener('click', () => fecharModal('modal-revisao'));
+document.getElementById('btn-voltar').addEventListener('click',    () => fecharModal('modal-revisao'));
+document.getElementById('overlay-rev').addEventListener('click',   () => fecharModal('modal-revisao'));
+
+// ── Confirmar ───────────────────────────────────
+document.getElementById('btn-confirmar').addEventListener('click', async () => {
+  const queixas  = document.getElementById('campo-queixas').value.trim();
+  const telefone = document.getElementById('campo-telefone').value.trim();
+
+  if (!queixas)                  return mostrarErro('Descreva suas queixas antes de continuar.');
+  if (telefone.length < 8)       return mostrarErro('Informe um telefone válido.');
+
+  const btn = document.getElementById('btn-confirmar');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="material-symbols-outlined animate-spin text-sm">progress_activity</span>';
+
+  const form = new FormData();
+  form.append('acao',     'reservar');
+  form.append('slot_id',  slotAtual.id);
+  form.append('queixas',  queixas);
+  form.append('telefone', telefone);
+
+  try {
+    const res  = await fetch('../api/reserva_action.php', { method:'POST', body: form });
+    const data = await res.json();
+
+    fecharModal('modal-revisao');
+
+    if (!data.ok) {
+      setTimeout(() => { abrirModal('modal-revisao'); mostrarErro(data.msg); }, 200);
+      return;
+    }
+
+    if (data.tipo === 'fila') {
+      document.getElementById('fila-desc').textContent =
+        `Você está na posição ${data.posicao} da fila para ${slotAtual.dia} (${slotAtual.data}) às ${slotAtual.hora.split('–')[0].trim()}. Você será avisado(a) por e-mail quando surgir uma vaga.`;
+      setTimeout(() => abrirModal('modal-fila'), 200);
+    } else {
+      document.getElementById('suc-desc').textContent =
+        'Sua solicitação foi enviada! O terapeuta receberá e confirmará em breve.';
+      document.getElementById('suc-resumo').innerHTML = `
+        <p class="flex items-center gap-2 text-on-surface-variant text-sm">
+          <span class="material-symbols-outlined text-secondary text-sm">schedule</span>
+          <span class="font-medium text-on-surface">${slotAtual.dia} ${slotAtual.data} • ${slotAtual.hora}</span>
+        </p>
+        <p class="flex items-center gap-2 text-on-surface-variant text-sm">
+          <span class="material-symbols-outlined text-secondary text-sm">person</span>
+          <span class="font-medium text-on-surface">${slotAtual.terapeuta}</span>
+        </p>
+        <p class="flex items-center gap-2 text-on-surface-variant text-sm">
+          <span class="material-symbols-outlined text-secondary text-sm">location_on</span>
+          <span class="font-medium text-on-surface">${slotAtual.local || 'A definir'}</span>
+        </p>`;
+      setTimeout(() => abrirModal('modal-sucesso'), 200);
+    }
+  } catch(e) {
+    mostrarErro('Erro de conexão. Tente novamente.');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = `<span id="btn-label">${slotAtual?.lotado ? 'Entrar na Fila' : 'Confirmar Agendamento'}</span><span class="material-symbols-outlined text-sm">check_circle</span>`;
+  }
+});
+
+// ── Helpers ─────────────────────────────────────
+function abrirModal(id)  { document.getElementById(id).classList.add('open'); document.body.style.overflow='hidden'; }
+function fecharModal(id) { document.getElementById(id).classList.remove('open'); document.body.style.overflow=''; }
+function mostrarErro(msg) {
+  const el = document.getElementById('rev-erro');
+  document.getElementById('rev-erro-msg').textContent = msg;
+  el.classList.remove('hidden');
+  el.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
+function esconderErro() { document.getElementById('rev-erro').classList.add('hidden'); }
 </script>
 </body>
 </html>
