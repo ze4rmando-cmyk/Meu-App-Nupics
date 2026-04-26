@@ -1,744 +1,1442 @@
 <?php
 session_start();
+if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'terapeuta') {
+    header('Location: ../index.php'); exit;
+}
 require_once '../config/db.php';
 
-if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'coordenador') {
-    header('Location: ../index.php');
-    exit;
+$uid  = (int)$_SESSION['usuario_id'];
+$nome = $_SESSION['nome'];
+$pri  = explode(' ',$nome)[0];
+$aba  = $_GET['aba'] ?? 'painel';
+
+// ── Dados comuns ──────────────────────────────────────────────────────────────
+$terapeuta = $pdo->prepare("SELECT id, especialidade, periodo FROM terapeutas WHERE usuario_id=? AND ativo=1");
+$terapeuta->execute([$uid]); $ter = $terapeuta->fetch(PDO::FETCH_ASSOC);
+
+$frase_row = $pdo->query("SELECT texto, autor FROM frases WHERE tipo='terapeuta' AND ativo=1 ORDER BY RAND() LIMIT 1")->fetch();
+$frase = $frase_row['texto'] ?? '"Presença plena é o maior presente que um terapeuta pode oferecer."';
+$frase_autor = $frase_row['autor'] ?? null;
+
+$avisos = $pdo->query("SELECT * FROM avisos WHERE ativo=1 AND destino IN ('todos','terapeuta') ORDER BY criado_em DESC LIMIT 5")->fetchAll(PDO::FETCH_ASSOC);
+$playlists = $pdo->query("SELECT id, emoji, nome, url FROM playlists WHERE ativo=1 ORDER BY ordem")->fetchAll(PDO::FETCH_ASSOC);
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+$stats = $pdo->prepare("SELECT
+  (SELECT COUNT(*) FROM ciclos c JOIN reservas r ON c.reserva_id=r.id JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=? AND c.status='concluido') AS total_concluidos,
+  (SELECT COUNT(*) FROM ciclos c JOIN reservas r ON c.reserva_id=r.id JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=? AND c.status='ativo') AS ciclos_ativos,
+  (SELECT COUNT(*) FROM sessoes_plantao WHERE terapeuta_id=?) AS plantoes_total,
+  (SELECT COUNT(*) FROM reservas r JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=? AND r.status='pendente') AS pendentes_hoje,
+  (SELECT COUNT(*) FROM slots s WHERE s.terapeuta_id=? AND s.ativo=1) AS total_slots
+");
+$stats->execute([$uid,$uid,$uid,$uid,$uid]); $stats = $stats->fetch(PDO::FETCH_ASSOC);
+
+// ── Plantão aberto hoje ───────────────────────────────────────────────────────
+$plt_stmt = $pdo->prepare("SELECT p.*, COUNT(sp.id) AS total_atendidos
+    FROM plantoes p LEFT JOIN sessoes_plantao sp ON sp.plantao_id=p.id
+    WHERE p.terapeuta_id=? AND p.data=CURDATE() AND p.status='aberto'
+    GROUP BY p.id LIMIT 1");
+$plt_stmt->execute([$uid]); $plantao_aberto = $plt_stmt->fetch(PDO::FETCH_ASSOC);
+
+// ── Dados específicos por aba ─────────────────────────────────────────────────
+$ciclos = $pendentes = $meus_slots = $pacientes_lista = $terapeutas_lista = $atividade = [];
+
+if ($aba === 'painel') {
+    $ciclos = $pdo->prepare("
+        SELECT c.id AS ciclo_id, c.total_sessoes, c.faltas, c.status AS ciclo_status,
+               r.id AS reserva_id, r.paciente_id AS pac_uid, r.data_sessao,
+               u.nome AS pnome, u.telefone,
+               s.hora_inicio, s.hora_fim, s.dia_semana, s.local, s.praticas,
+               (SELECT COUNT(*) FROM anamnese_inicial WHERE ciclo_id=c.id) AS tem_anamnese,
+               (SELECT COUNT(*) FROM registros_sessao WHERE ciclo_id=c.id AND status='realizado') AS followups_ok
+        FROM ciclos c JOIN reservas r ON c.reserva_id=r.id
+        JOIN usuarios u ON r.paciente_id=u.id JOIN slots s ON r.slot_id=s.id
+        WHERE s.terapeuta_id=? AND c.status='ativo' ORDER BY s.dia_semana, s.hora_inicio LIMIT 5
+    ")->execute([$uid]) ? true : false;
+    // re-fetch properly
+    $cq = $pdo->prepare("
+        SELECT c.id AS ciclo_id, c.total_sessoes, c.faltas,
+               r.paciente_id AS pac_uid, r.data_sessao,
+               u.nome AS pnome, u.telefone,
+               s.hora_inicio, s.hora_fim, s.dia_semana, s.praticas,
+               (SELECT COUNT(*) FROM anamnese_inicial WHERE ciclo_id=c.id) AS tem_anamnese,
+               (SELECT COUNT(*) FROM registros_sessao WHERE ciclo_id=c.id AND status='realizado') AS followups_ok
+        FROM ciclos c JOIN reservas r ON c.reserva_id=r.id
+        JOIN usuarios u ON r.paciente_id=u.id JOIN slots s ON r.slot_id=s.id
+        WHERE s.terapeuta_id=? AND c.status='ativo' ORDER BY s.dia_semana, s.hora_inicio LIMIT 5
+    ");
+    $cq->execute([$uid]); $ciclos = $cq->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($ciclos as &$cic) {
+        $cic['sessoes_feitas'] = (int)$cic['tem_anamnese'] + (int)$cic['followups_ok'];
+        $cic['proxima_sessao'] = $cic['tem_anamnese']==0 ? 1 : ((int)$cic['tem_anamnese']+(int)$cic['followups_ok']+1);
+    } unset($cic);
+    $pend_q = $pdo->prepare("SELECT r.id, r.queixas, r.data_sessao, u.nome AS pnome, s.hora_inicio, s.hora_fim, s.dia_semana
+        FROM reservas r JOIN slots s ON r.slot_id=s.id JOIN usuarios u ON r.paciente_id=u.id
+        WHERE s.terapeuta_id=? AND r.status='pendente' LIMIT 5");
+    $pend_q->execute([$uid]); $pendentes = $pend_q->fetchAll(PDO::FETCH_ASSOC);
+    $atividade = $pdo->query("
+        (SELECT 'ciclo' AS tipo, c.encerrado_em AS dt, u.nome AS envolvido, s.praticas AS extra
+         FROM ciclos c JOIN reservas r ON c.reserva_id=r.id JOIN usuarios u ON r.paciente_id=u.id JOIN slots s ON r.slot_id=s.id
+         WHERE c.status='concluido' AND c.encerrado_em IS NOT NULL ORDER BY c.encerrado_em DESC LIMIT 4)
+        UNION ALL
+        (SELECT 'plantao', sp.criado_em, sp.paciente_nome, sp.tipo_pratica FROM sessoes_plantao sp WHERE sp.terapeuta_id={$uid} ORDER BY sp.criado_em DESC LIMIT 4)
+        ORDER BY dt DESC LIMIT 6
+    ")->fetchAll(PDO::FETCH_ASSOC);
 }
 
-$sucesso = '';
-$erro    = '';
-
-// ── POST actions ──
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['acao'])) {
-    $acao = $_POST['acao'];
-
-    // Plantão
-    if ($acao === 'registrar_plantao') {
-        $tid  = (int)$_POST['terapeuta_id'];
-        $pnome= trim($_POST['paciente_nome']??'');
-        $pid  = !empty($_POST['paciente_id'])?(int)$_POST['paciente_id']:null;
-        $prat = trim($_POST['tipo_pratica']??'');
-        $data = $_POST['data_sessao']??date('Y-m-d');
-        $hora = $_POST['hora_sessao']??date('H:i');
-        $stat = $_POST['status_sessao']??'realizado';
-        $obs  = trim($_POST['observacao']??'');
-        if (!$tid||!$pnome||!$prat){$erro='Preencha terapeuta, paciente e prática.';}
-        else {
-            if (!$pid) {
-                $chk=$pdo->prepare('SELECT p.id FROM pacientes p JOIN usuarios u ON u.id=p.usuario_id WHERE u.nome LIKE ? LIMIT 1');
-                $chk->execute(['%'.$pnome.'%']); $f=$chk->fetch(); if($f) $pid=$f['id'];
-            }
-            $pdo->prepare('INSERT INTO sessoes_plantao(terapeuta_id,data,hora_inicio,paciente_id,paciente_nome,tipo_pratica,status,observacao)VALUES(?,?,?,?,?,?,?,?)')->execute([$tid,$data,$hora.':00',$pid,$pnome,$prat,$stat,$obs]);
-            if ($pid) {
-                $stmt=$pdo->prepare('SELECT id FROM ciclos WHERE paciente_id=? AND terapeuta_id=? AND status="ativo" LIMIT 1');$stmt->execute([$pid,$tid]);$ciclo=$stmt->fetch();
-                if (!$ciclo) {
-                    $ds=date('N',strtotime($data));
-                    $hq=$pdo->prepare('SELECT h.id FROM horarios h JOIN horario_terapeutas ht ON ht.horario_id=h.id WHERE ht.terapeuta_id=? AND h.dia_semana=? AND h.ativo=1 LIMIT 1');$hq->execute([$tid,$ds]);$hor=$hq->fetch();
-                    if($hor){$pdo->prepare('INSERT INTO ciclos(paciente_id,terapeuta_id,total_sessoes,status)VALUES(?,?,4,"ativo")')->execute([$pid,$tid]);$cid=$pdo->lastInsertId();$pdo->prepare('INSERT INTO agendamentos(ciclo_id,horario_id,data,numero_sessao,status)VALUES(?,?,?,1,"realizado")')->execute([$cid,$hor['id'],$data]);}
-                }
-            }
-            $sucesso='Sessão de plantão registrada!';
-        }
-    }
-
-    // Usuário
-    if ($acao==='cadastrar_usuario') {
-        $nome=trim($_POST['nome']??'');$email=trim($_POST['email']??'');$senha=trim($_POST['senha']??'');$tipo=$_POST['tipo']??'';$tel=trim($_POST['telefone']??'');$esp=trim($_POST['especialidade']??'');$per=trim($_POST['periodo']??'');$cpf=trim($_POST['cpf']??'');
-        if(!$nome||!$email||!$senha||!$tipo){$erro='Preencha os campos obrigatórios.';}
-        else{$chk=$pdo->prepare('SELECT id FROM usuarios WHERE email=?');$chk->execute([$email]);if($chk->fetch()){$erro='E-mail já cadastrado.';}else{$hash=password_hash($senha,PASSWORD_DEFAULT);$pdo->prepare('INSERT INTO usuarios(nome,email,senha,tipo,telefone)VALUES(?,?,?,?,?)')->execute([$nome,$email,$hash,$tipo,$tel]);$uid=$pdo->lastInsertId();if($tipo==='terapeuta'){$pdo->prepare('INSERT INTO terapeutas(usuario_id,especialidade,periodo)VALUES(?,?,?)')->execute([$uid,$esp,$per]);}elseif($tipo==='paciente'){$pdo->prepare('INSERT INTO pacientes(usuario_id,cpf)VALUES(?,?)')->execute([$uid,$cpf]);}$sucesso=ucfirst($tipo).' '.htmlspecialchars($nome).' cadastrado!';}}
-    }
-
-    if($acao==='desativar_terapeuta'){$pdo->prepare('UPDATE terapeutas SET ativo=0 WHERE id=?')->execute([(int)$_POST['terapeuta_id']]);$sucesso='Terapeuta desativado.';}
-    if($acao==='reativar_terapeuta'){$pdo->prepare('UPDATE terapeutas SET ativo=1 WHERE id=?')->execute([(int)$_POST['terapeuta_id']]);$sucesso='Terapeuta reativado.';}
-    if($acao==='estender_ciclo'){$pdo->prepare('UPDATE ciclos SET total_sessoes=total_sessoes+1 WHERE id=?')->execute([(int)$_POST['ciclo_id']]);$sucesso='Ciclo estendido.';}
-    if($acao==='concluir_ciclo'){$pdo->prepare('UPDATE ciclos SET status="concluido" WHERE id=?')->execute([(int)$_POST['ciclo_id']]);$sucesso='Ciclo concluído.';}
-    if($acao==='add_horario'){$dia=(int)$_POST['dia_semana'];$hora=trim($_POST['hora_inicio']??'');$dur=(int)$_POST['duracao'];$vag=(int)$_POST['vagas'];if(!$dia||!$hora||!$dur||!$vag){$erro='Preencha todos os campos.';}else{$chk=$pdo->prepare('SELECT id FROM horarios WHERE dia_semana=? AND hora_inicio=?');$chk->execute([$dia,$hora.':00']);if($chk->fetch()){$erro='Já existe este horário.';}else{$pdo->prepare('INSERT INTO horarios(dia_semana,hora_inicio,duracao_minutos,vagas_total,ativo)VALUES(?,?,?,?,1)')->execute([$dia,$hora.':00',$dur,$vag]);$nid=$pdo->lastInsertId();foreach($pdo->query('SELECT id FROM terapeutas WHERE ativo=1')->fetchAll() as $t)$pdo->prepare('INSERT INTO horario_terapeutas(horario_id,terapeuta_id)VALUES(?,?)')->execute([$nid,$t['id']]);$sucesso='Horário adicionado.';}}}
-    if($acao==='toggle_horario'){$pdo->prepare('UPDATE horarios SET ativo=? WHERE id=?')->execute([(int)$_POST['estado'],(int)$_POST['horario_id']]);$sucesso='Horário atualizado.';}
-    if($acao==='editar_vagas'){$v=(int)$_POST['vagas'];if($v>=1&&$v<=20)$pdo->prepare('UPDATE horarios SET vagas_total=? WHERE id=?')->execute([$v,(int)$_POST['horario_id']]);$sucesso='Vagas atualizadas.';}
-    if($acao==='status_visita'){$s=$_POST['novo_status']??'';if(in_array($s,['pendente','aprovada','realizada','cancelada']))$pdo->prepare('UPDATE visitas_externas SET status=? WHERE id=?')->execute([$s,(int)$_POST['visita_id']]);$sucesso='Status atualizado.';}
-    if($acao==='add_aviso'){$pdo->prepare('INSERT INTO avisos(tipo,titulo,texto)VALUES(?,?,?)')->execute([$_POST['tipo_aviso']??'info',trim($_POST['titulo_aviso']??''),trim($_POST['texto_aviso']??'')]);$sucesso='Aviso criado.';}
-    if($acao==='del_aviso'){$pdo->prepare('UPDATE avisos SET ativo=0 WHERE id=?')->execute([(int)$_POST['aviso_id']]);$sucesso='Aviso removido.';}
-
-    // Frases
-    if($acao==='add_frase'){$pdo->prepare('INSERT INTO frases(tipo,texto,autor)VALUES(?,?,?)')->execute([$_POST['frase_tipo']??'paciente',trim($_POST['frase_texto']??''),trim($_POST['frase_autor']??'')?:null]);$sucesso='Frase adicionada.';}
-    if($acao==='del_frase'){$pdo->prepare('UPDATE frases SET ativo=0 WHERE id=?')->execute([(int)$_POST['frase_id']]);$sucesso='Frase removida.';}
-
-    // Playlists
-    if($acao==='add_playlist'){$max=$pdo->query('SELECT MAX(ordem) FROM playlists')->fetchColumn();$pdo->prepare('INSERT INTO playlists(emoji,nome,url,ordem)VALUES(?,?,?,?)')->execute([trim($_POST['pl_emoji']??'🎵'),trim($_POST['pl_nome']??''),trim($_POST['pl_url']??''),$max+1]);$sucesso='Playlist adicionada.';}
-    if($acao==='del_playlist'){$pdo->prepare('UPDATE playlists SET ativo=0 WHERE id=?')->execute([(int)$_POST['playlist_id']]);$sucesso='Playlist removida.';}
+if ($aba === 'cronograma') {
+    $meus_slots = $pdo->prepare("
+        SELECT s.*,
+          (SELECT COUNT(*) FROM reservas r WHERE r.slot_id=s.id AND r.status NOT IN ('cancelado') AND r.data_sessao>=CURDATE()) AS reservas_ativas,
+          DATE_ADD(CURDATE(), INTERVAL MOD(s.dia_semana-1-WEEKDAY(CURDATE())+7,7) DAY) AS prox_data
+        FROM slots s WHERE s.terapeuta_id=? ORDER BY s.dia_semana, s.hora_inicio
+    ");
+    $meus_slots->execute([$uid]); $meus_slots = $meus_slots->fetchAll(PDO::FETCH_ASSOC);
+    // Para cada slot, busca pacientes agendados
+    foreach ($meus_slots as &$sl) {
+        $pac = $pdo->prepare("SELECT u.nome FROM reservas r JOIN usuarios u ON r.paciente_id=u.id
+            WHERE r.slot_id=? AND r.status NOT IN ('cancelado') AND r.data_sessao=?");
+        $pac->execute([$sl['id'], $sl['prox_data']]);
+        $sl['pac_nomes'] = $pac->fetchAll(PDO::FETCH_COLUMN);
+    } unset($sl);
 }
 
-// ── Dados ──
-$metricas = $pdo->query('SELECT (SELECT COUNT(*) FROM usuarios WHERE tipo="paciente") AS total_pacientes,(SELECT COUNT(*) FROM terapeutas WHERE ativo=1) AS terapeutas_ativos,(SELECT COUNT(*) FROM ciclos WHERE status="ativo") AS ciclos_ativos,(SELECT COUNT(*) FROM agendamentos WHERE MONTH(data)=MONTH(CURDATE()) AND status="realizado") AS sessoes_mes,(SELECT COUNT(*) FROM agendamentos WHERE data=CURDATE() AND status="agendado") AS hoje,(SELECT COUNT(*) FROM sessoes_plantao WHERE data=CURDATE()) AS plantoes_hoje')->fetch();
+if ($aba === 'pacientes') {
+    $pacientes_lista = $pdo->prepare("
+        SELECT DISTINCT u.id, u.nome, u.email, u.telefone, u.criado_em,
+               p.sexo, p.data_nasc, p.vinculo, p.objetivos, p.bloqueado_ate,
+               (SELECT COUNT(*) FROM ciclos c2 JOIN reservas r2 ON c2.reserva_id=r2.id
+                JOIN slots s2 ON r2.slot_id=s2.id WHERE r2.paciente_id=u.id AND s2.terapeuta_id=?) AS meus_ciclos,
+               (SELECT c3.status FROM ciclos c3 JOIN reservas r3 ON c3.reserva_id=r3.id
+                JOIN slots s3 ON r3.slot_id=s3.id WHERE r3.paciente_id=u.id AND s3.terapeuta_id=? AND c3.status='ativo' LIMIT 1) AS status_ciclo_ativo
+        FROM reservas r JOIN slots s ON r.slot_id=s.id
+        JOIN usuarios u ON r.paciente_id=u.id JOIN pacientes p ON p.usuario_id=u.id
+        WHERE s.terapeuta_id=? ORDER BY u.nome
+    ");
+    $pacientes_lista->execute([$uid,$uid,$uid]); $pacientes_lista = $pacientes_lista->fetchAll(PDO::FETCH_ASSOC);
+}
 
-$agenda_hoje = $pdo->query('SELECT h.hora_inicio, up.nome AS paciente_nome, t.especialidade AS terapia, a.status, ut.nome AS terapeuta_nome, "agendamento" AS tipo FROM agendamentos a JOIN horarios h ON h.id=a.horario_id JOIN ciclos c ON c.id=a.ciclo_id JOIN pacientes p ON p.id=c.paciente_id JOIN usuarios up ON up.id=p.usuario_id LEFT JOIN terapeutas t ON t.id=a.terapeuta_id LEFT JOIN usuarios ut ON ut.id=t.usuario_id WHERE a.data=CURDATE() UNION ALL SELECT sp.hora_inicio, sp.paciente_nome, sp.tipo_pratica, sp.status, u.nome, "plantao" FROM sessoes_plantao sp JOIN terapeutas t ON t.id=sp.terapeuta_id JOIN usuarios u ON u.id=t.usuario_id WHERE sp.data=CURDATE() ORDER BY hora_inicio')->fetchAll();
+if ($aba === 'terapeutas') {
+    $terapeutas_lista = $pdo->query("
+        SELECT u.id, u.nome, u.email, u.telefone, t.especialidade, t.periodo, t.ativo,
+               (SELECT COUNT(*) FROM ciclos c JOIN reservas r ON c.reserva_id=r.id JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=u.id AND c.status='ativo') AS ciclos_ativos,
+               (SELECT COUNT(*) FROM ciclos c JOIN reservas r ON c.reserva_id=r.id JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=u.id AND c.status='concluido') AS ciclos_concluidos
+        FROM terapeutas t JOIN usuarios u ON t.usuario_id=u.id ORDER BY u.nome
+    ")->fetchAll(PDO::FETCH_ASSOC);
+}
 
-$sessoes_semana = $pdo->query('SELECT DAYOFWEEK(data) AS dia, COUNT(*) AS total FROM agendamentos WHERE data>=DATE_SUB(CURDATE(),INTERVAL 28 DAY) AND status="realizado" GROUP BY DAYOFWEEK(data)')->fetchAll(PDO::FETCH_KEY_PAIR);
-$max_bar = max(array_values($sessoes_semana)?:[1]);
-
-$terapeutas = $pdo->query('SELECT t.id,t.ativo,t.especialidade,t.periodo,u.nome,u.email,u.telefone,COUNT(DISTINCT c.paciente_id) AS total_pacientes,COUNT(CASE WHEN a.status="realizado" AND MONTH(a.data)=MONTH(CURDATE()) THEN 1 END) AS sessoes_mes FROM terapeutas t JOIN usuarios u ON u.id=t.usuario_id LEFT JOIN ciclos c ON c.terapeuta_id=t.id LEFT JOIN agendamentos a ON a.ciclo_id=c.id GROUP BY t.id,t.ativo,t.especialidade,t.periodo,u.nome,u.email,u.telefone ORDER BY t.ativo DESC,u.nome')->fetchAll();
-
-$pacientes = $pdo->query('SELECT p.id,u.nome,u.email,u.telefone,p.cpf,c.id AS ciclo_id,c.status AS ciclo_status,c.total_sessoes,ut.nome AS terapeuta_nome,t.especialidade,COUNT(CASE WHEN a.status="realizado" THEN 1 END) AS sessoes_feitas FROM pacientes p JOIN usuarios u ON u.id=p.usuario_id LEFT JOIN ciclos c ON c.paciente_id=p.id AND c.status="ativo" LEFT JOIN terapeutas t ON t.id=c.terapeuta_id LEFT JOIN usuarios ut ON ut.id=t.usuario_id LEFT JOIN agendamentos a ON a.ciclo_id=c.id GROUP BY p.id,u.nome,u.email,u.telefone,p.cpf,c.id,c.status,c.total_sessoes,ut.nome,t.especialidade ORDER BY u.nome')->fetchAll();
-
-$ciclos_todos = $pdo->query('SELECT c.id,c.total_sessoes,c.status,up.nome AS paciente_nome,ut.nome AS terapeuta_nome,t.especialidade,COUNT(CASE WHEN a.status="realizado" THEN 1 END) AS feitas FROM ciclos c JOIN pacientes p ON p.id=c.paciente_id JOIN usuarios up ON up.id=p.usuario_id LEFT JOIN terapeutas t ON t.id=c.terapeuta_id LEFT JOIN usuarios ut ON ut.id=t.usuario_id LEFT JOIN agendamentos a ON a.ciclo_id=c.id WHERE c.status="ativo" GROUP BY c.id ORDER BY up.nome')->fetchAll();
-
-$todos_horarios = $pdo->query('SELECT h.id,h.dia_semana,h.hora_inicio,h.duracao_minutos,h.vagas_total,h.ativo,COUNT(DISTINCT ht.terapeuta_id) AS num_terapeutas,COUNT(DISTINCT CASE WHEN a.status="agendado" AND a.data>=CURDATE() THEN a.id END) AS proximos_agend FROM horarios h LEFT JOIN horario_terapeutas ht ON ht.horario_id=h.id LEFT JOIN agendamentos a ON a.horario_id=h.id GROUP BY h.id ORDER BY h.dia_semana,h.hora_inicio')->fetchAll();
-
-$agendamentos_semana = $pdo->query('SELECT a.id,a.status,a.data,h.hora_inicio,h.dia_semana,up.nome AS paciente_nome,ut.nome AS terapeuta_nome,t.especialidade FROM agendamentos a JOIN horarios h ON h.id=a.horario_id JOIN ciclos c ON c.id=a.ciclo_id JOIN pacientes p ON p.id=c.paciente_id JOIN usuarios up ON up.id=p.usuario_id LEFT JOIN terapeutas t ON t.id=a.terapeuta_id LEFT JOIN usuarios ut ON ut.id=t.usuario_id WHERE a.data BETWEEN DATE_SUB(CURDATE(),INTERVAL WEEKDAY(CURDATE()) DAY) AND DATE_ADD(DATE_SUB(CURDATE(),INTERVAL WEEKDAY(CURDATE()) DAY),INTERVAL 4 DAY) ORDER BY a.data,h.hora_inicio')->fetchAll();
-
-$visitas = $pdo->query('SELECT v.*,u.nome AS solicitante_nome,u.telefone AS solicitante_tel FROM visitas_externas v JOIN usuarios u ON u.id=v.solicitante_id ORDER BY v.criado_em DESC')->fetchAll();
-
-$avisos = $pdo->query('SELECT * FROM avisos WHERE ativo=1 ORDER BY criado_em DESC')->fetchAll();
-
-$frases_paciente  = $pdo->query('SELECT * FROM frases WHERE tipo="paciente" AND ativo=1 ORDER BY id')->fetchAll();
-$frases_terapeuta = $pdo->query('SELECT * FROM frases WHERE tipo="terapeuta" AND ativo=1 ORDER BY id')->fetchAll();
-$playlists_db     = $pdo->query('SELECT * FROM playlists WHERE ativo=1 ORDER BY ordem')->fetchAll();
-
-$historico_plantoes = $pdo->query('SELECT sp.*,u.nome AS terapeuta_nome FROM sessoes_plantao sp JOIN terapeutas t ON t.id=sp.terapeuta_id JOIN usuarios u ON u.id=t.usuario_id ORDER BY sp.data DESC,sp.hora_inicio DESC LIMIT 50')->fetchAll();
-
-$top_praticas = $pdo->query('SELECT tipo_pratica,COUNT(*) AS total FROM sessoes_plantao GROUP BY tipo_pratica ORDER BY total DESC LIMIT 5')->fetchAll();
-
-$cores  = [['bg'=>'#E1F5EE','txt'=>'#085041'],['bg'=>'#E6F1FB','txt'=>'#0C447C'],['bg'=>'#FAEEDA','txt'=>'#633806'],['bg'=>'#FBEAF0','txt'=>'#72243E'],['bg'=>'#EAF3DE','txt'=>'#27500A']];
-$dias_pt = ['','Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'];
-$dias_sel= ['1'=>'Segunda','2'=>'Terça','3'=>'Quarta','4'=>'Quinta','5'=>'Sexta'];
-$tipos_aviso = ['info'=>'Info','evento'=>'Evento','manutencao'=>'Manutenção','urgente'=>'Urgente'];
-$tipos_visita= ['ubs'=>'UBS','hospital'=>'Hospital','clinica'=>'Clínica','empresa'=>'Empresa','outro'=>'Outro'];
-function ini($n){$p=explode(' ',$n);$i='';foreach($p as $x){$i.=strtoupper(mb_substr($x,0,1));if(strlen($i)>=2)break;}return $i;}
-$primeiro = explode(' ',$_SESSION['nome'])[0];
-$frase_hoje = !empty($frases_terapeuta) ? $frases_terapeuta[date('z')%count($frases_terapeuta)]['texto'] : '"Presença plena é o maior presente que um terapeuta pode oferecer."';
+$dias = [1=>'Seg',2=>'Ter',3=>'Qua',4=>'Qui',5=>'Sex'];
+$dias_full = [1=>'Segunda',2=>'Terça',3=>'Quarta',4=>'Quinta',5=>'Sexta'];
+$praticas_opcoes = ['Massoterapia','Ventosaterapia','Acupuntura','Reiki','Auriculoterapia','Meditação','Aromaterapia','Reflexologia','Outros'];
+$stats_gerais = $pdo->query("SELECT
+  (SELECT COUNT(*) FROM ciclos WHERE status='concluido') AS ciclos_conc,
+  (SELECT COUNT(*) FROM ciclos WHERE status='ativo') AS ciclos_atv,
+  (SELECT COUNT(*) FROM sessoes_plantao WHERE status='realizado') AS plt_total,
+  (SELECT COUNT(DISTINCT r.paciente_id) FROM reservas r) AS pac_atend,
+  (SELECT COUNT(*) FROM usuarios WHERE tipo='paciente') AS pac_cad
+")->fetch(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NUPICS — Gestão</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
-  <script>
-    tailwind.config={theme:{extend:{fontFamily:{headline:['Plus Jakarta Sans'],body:['Manrope']},colors:{primary:'#4e0078',secondary:'#b7004d'}}}}
-  </script>
-  <style>
-    .scrollbar-hide::-webkit-scrollbar { display: none; }
-.scrollbar-hide { scrollbar-width: none; }
-    body{font-family:'Manrope',sans-serif;background:#fff7fc;}
-    h1,h2,h3{font-family:'Plus Jakarta Sans',sans-serif;}
-    .material-symbols-outlined{font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 24;}
-    .glass{background:rgba(255,255,255,.65);backdrop-filter:blur(12px);}
-    .grad{background:linear-gradient(135deg,#4e0078,#b7004d);}
-    .nav-tab{padding:10px 14px;font-size:12px;font-weight:600;color:#888;cursor:pointer;background:transparent;border:none;border-bottom:2px solid transparent;white-space:nowrap;font-family:'Manrope',sans-serif;transition:color .15s;}
-    .nav-tab.on{color:#4e0078;border-bottom-color:#4e0078;}
-    .nav-tab:hover{color:#4e0078;}
-    .modal-bg{display:none;position:fixed;inset:0;z-index:100;background:rgba(32,25,35,.55);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:1rem;}
-    .modal-bg.open{display:flex;}
-    .ciclo-dot{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;}
-    .cdot-feito{background:#1D9E75;color:white;}
-    .cdot-prox{background:#E1F5EE;border:2px solid #1D9E75;color:#085041;}
-    .cdot-vazio{background:#f5f5f3;border:1px solid #ddd;color:#aaa;}
-  </style>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NUPICS | <?= ucfirst($aba) ?></title>
+<script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
+<script>tailwind.config={theme:{extend:{colors:{
+  "surface":"#fff7fc","on-surface":"#201923","outline-variant":"#d0c2d3","outline":"#7f7383",
+  "surface-container-low":"#fdeffe","surface-container":"#f7eaf8","surface-container-high":"#f2e4f2",
+  "surface-container-highest":"#ecdeed","on-surface-variant":"#4d4351",
+  "primary":"#4e0078","secondary":"#b7004d","background":"#fff7fc",
+  "error":"#ba1a1a","error-container":"#ffdad6","on-error-container":"#93000a"
+},fontFamily:{"headline":["Plus Jakarta Sans"],"body":["Manrope"]}}}}</script>
+<style>
+  body{font-family:"Manrope",sans-serif;background:radial-gradient(135deg,#f4d9ff 0%,#fff7fc 45%,#fdeffe 100%)}
+  h1,h2,h3,h4{font-family:"Plus Jakarta Sans",sans-serif}
+  .material-symbols-outlined{font-variation-settings:"FILL" 0,"wght" 400,"GRAD" 0,"opsz" 24}
+  .glass{background:rgba(255,255,255,.78);backdrop-filter:blur(18px) saturate(180%);border:1px solid rgba(255,255,255,.45)}
+
+  /* NAV HORIZONTAL */
+  .nav-tab{display:flex;align-items:center;gap:6px;padding:10px 18px;border-radius:99px;
+           font-size:.8rem;font-weight:600;color:#4d4351;transition:.15s;white-space:nowrap;cursor:pointer;
+           text-decoration:none}
+  .nav-tab:hover{background:rgba(78,0,120,.07);color:#4e0078}
+  .nav-tab.active{background:#4e0078;color:#fff}
+  .nav-tab .material-symbols-outlined{font-size:18px}
+
+  /* Modal */
+  .modal-wrap{display:none}.modal-wrap.open{display:flex;animation:mfade .18s ease}
+  @keyframes mfade{from{opacity:0}to{opacity:1}}
+  .modal-card{animation:mup .22s cubic-bezier(.22,1,.36,1)}
+  @keyframes mup{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
+
+  /* Cards */
+  .card-h{transition:box-shadow .15s,transform .15s}
+  .card-h:hover{transform:translateY(-2px);box-shadow:0 8px 28px rgba(78,0,120,.10)}
+
+  /* Campo */
+  .campo{display:flex;align-items:flex-start;background:rgba(255,255,255,.7);border:1.5px solid #d0c2d3;border-radius:12px;overflow:hidden;transition:.15s}
+  .campo:focus-within{border-color:#4e0078;box-shadow:0 0 0 3px rgba(78,0,120,.12)}
+  .campo .ic{padding:10px 10px 0;color:#7f7383;flex-shrink:0}
+  .campo input,.campo select,.campo textarea{flex:1;border:none;background:transparent;padding:10px 12px 10px 0;font-size:.85rem;color:#201923;font-family:"Manrope",sans-serif;outline:none;min-width:0;resize:vertical}
+
+  /* Pills checkbox */
+  .pill-opt{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border-radius:99px;
+            border:1.5px solid #d0c2d3;font-size:.75rem;font-weight:600;cursor:pointer;
+            background:rgba(255,255,255,.6);color:#4d4351;user-select:none;transition:.15s}
+  .pill-opt:has(input:checked){background:#4e0078;color:#fff;border-color:#4e0078}
+  .pill-opt input{display:none}
+
+  /* Toggle */
+  .tog{position:relative;width:36px;height:20px;background:#d0c2d3;border-radius:10px;transition:.2s;cursor:pointer;flex-shrink:0}
+  .tog:has(input:checked){background:#4e0078}
+  .tog input{position:absolute;opacity:0;width:100%;height:100%;cursor:pointer;margin:0}
+  .tog::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s;pointer-events:none}
+  .tog:has(input:checked)::after{transform:translateX(16px)}
+
+  /* Progresso ciclo */
+  .pdot{width:1.5rem;height:1.5rem;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.62rem;font-weight:700;transition:.3s}
+  .pdot.done{background:#4e0078;color:#fff}.pdot.curr{background:#4e0078;color:#fff;box-shadow:0 0 0 3px rgba(78,0,120,.2)}.pdot.idle{background:#ecdeed;color:#7f7383}
+
+  /* Cronograma grid */
+  .cron-cell{min-height:80px;border-right:1px solid #ecdeed;border-bottom:1px solid #ecdeed;padding:6px;vertical-align:top}
+  .cron-slot{border-radius:10px;padding:8px 10px;margin-bottom:4px;font-size:.75rem;cursor:pointer;transition:.15s}
+  .cron-slot:hover{filter:brightness(.95)}
+  .cron-slot.tipo-ciclo{background:#4e0078;color:#fff}
+  .cron-slot.tipo-plantao{background:linear-gradient(135deg,#4e0078,#b7004d);color:#fff}
+  .cron-slot.tipo-livre{border:2px dashed #d0c2d3;background:transparent;color:#7f7383;text-align:center}
+  .cron-slot.tipo-livre:hover{background:rgba(78,0,120,.05);border-color:#4e0078;color:#4e0078}
+
+  /* Aviso tipo */
+  .av-evento{border-left:3px solid #4e0078}.av-urgente{border-left:3px solid #b7004d}
+  .av-manutencao{border-left:3px solid #92400e}.av-info{border-left:3px solid #1d4ed8}
+
+  /* Stat bar */
+  .stat-bar{height:5px;border-radius:99px;background:linear-gradient(90deg,#4e0078,#b7004d)}
+
+  /* Search */
+  #busca-paciente,#busca-terapeuta{border:1.5px solid #d0c2d3;border-radius:99px;padding:8px 16px 8px 40px;font-size:.85rem;width:100%;font-family:"Manrope",sans-serif;background:#fff;outline:none;transition:.15s}
+  #busca-paciente:focus,#busca-terapeuta:focus{border-color:#4e0078;box-shadow:0 0 0 3px rgba(78,0,120,.12)}
+
+  textarea:focus,input:focus,select:focus{outline:none}
+  ::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#d0c2d3;border-radius:99px}
+</style>
 </head>
-<body class="min-h-screen">
+<body class="text-on-background min-h-screen flex flex-col">
 
-<!-- TOPNAV -->
-<nav class="fixed top-0 w-full z-50 bg-white/75 backdrop-blur-md shadow-sm border-b border-purple-100/40">
-  <div class="flex justify-between items-center px-5 md:px-8 h-14 max-w-[1600px] mx-auto">
-    <div class="flex items-center gap-6">
-      <span class="text-lg font-extrabold headline"
-            style="background:linear-gradient(135deg,#4e0078,#b7004d);-webkit-background-clip:text;-webkit-text-fill-color:transparent">
-        NUPICS
-      </span>
-      <div class="hidden md:flex overflow-x-auto gap-0">
-        <button class="nav-tab on" onclick="setAba('home')">Dashboard</button>
-        <button class="nav-tab" onclick="setAba('agenda')">Agendamentos</button>
-        <button class="nav-tab" onclick="setAba('ciclos')">Ciclos</button>
-        <button class="nav-tab" onclick="setAba('pacientes_tab')">Pacientes</button>
-        <button class="nav-tab" onclick="window.location='../terapeuta/plantoes.php'">Cronograma</button>
-        <button class="nav-tab" onclick="setAba('equipe')">Equipe</button>
-        <button class="nav-tab" onclick="setAba('gestao')">Gestão</button>
-        <button class="nav-tab" onclick="setAba('conteudo')">Conteúdo</button>
-      </div>
-    </div>
-    <div class="flex items-center gap-2">
-      <div class="relative hidden md:block">
-        <span class="material-symbols-outlined absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" style="font-size:16px">search</span>
-        <input type="text" id="busca-global" placeholder="Buscar paciente..."
-               oninput="buscarPacs(this.value)"
-               class="bg-gray-100 rounded-full py-1.5 pl-8 pr-3 text-xs w-44 focus:outline-none focus:ring-2 focus:ring-purple-200">
-        <div id="busca-res" class="absolute top-full left-0 right-0 bg-white border border-gray-100 rounded-xl shadow-lg mt-1 hidden z-10 text-sm"></div>
-      </div>
-      <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
-           style="background:#E1F5EE;color:#085041"><?= ini($_SESSION['nome']) ?></div>
-      <span class="text-xs text-gray-600 hidden md:block font-medium"><?= htmlspecialchars($primeiro) ?></span>
-      <a href="../api/trocar_senha.php" class="text-xs text-gray-400 border border-gray-200 rounded-full px-2.5 py-1 hover:text-purple-700 transition-colors hidden md:block">Senha</a>
-      <a href="../api/logout.php" class="text-xs text-gray-400 border border-gray-200 rounded-full px-2.5 py-1 hover:text-purple-700 transition-colors">Sair</a>
-    </div>
-  </div>
-</nav>
-
-<main class="pt-16 pb-12 px-4 md:px-8 max-w-[1600px] mx-auto">
-
-<?php if($sucesso): ?>
-<div class="mt-3 mb-3 bg-green-50 border border-green-200 text-green-800 rounded-xl px-4 py-2.5 text-sm font-medium"><?= htmlspecialchars($sucesso) ?></div>
-<?php endif; ?>
-<?php if($erro): ?>
-<div class="mt-3 mb-3 bg-red-50 border border-red-200 text-red-700 rounded-xl px-4 py-2.5 text-sm font-medium"><?= htmlspecialchars($erro) ?></div>
-<?php endif; ?>
-
-<!-- ══ DASHBOARD HOME ══ -->
-<div id="aba-home">
-  <!-- Hero -->
-  <div class="grad rounded-3xl p-6 text-white relative overflow-hidden flex flex-col md:flex-row items-center justify-between mb-6 shadow-xl mt-3">
-    <div class="relative z-10">
-      <h1 class="text-2xl font-extrabold headline">Bem-vindo, <?= htmlspecialchars($primeiro) ?>.</h1>
-      <p class="text-white/80 text-sm mt-1"><?= $metricas['hoje'] ?> atendimentos hoje · <?= $metricas['plantoes_hoje'] ?> plantões registrados · <?= $metricas['sessoes_mes'] ?> sessões no mês</p>
-    </div>
-    <div class="relative z-10 mt-4 md:mt-0 flex gap-3">
-      <button onclick="document.getElementById('modal-plantao').classList.add('open')"
-              class="bg-white text-purple-900 font-bold px-4 py-2.5 rounded-full flex items-center gap-2 hover:scale-105 transition-transform shadow text-sm">
-        <span class="material-symbols-outlined" style="font-size:16px">add_circle</span> Registrar Plantão
-      </button>
-    </div>
-    <div class="absolute -right-16 -top-16 w-56 h-56 bg-white/10 rounded-full blur-3xl"></div>
-    <div class="absolute -left-16 -bottom-16 w-56 h-56 bg-pink-500/20 rounded-full blur-3xl"></div>
-  </div>
-
-  <!-- Métricas -->
-  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-    <?php $cards=[['calendar_today','Hoje',$metricas['hoje'],'text-purple-700','bg-purple-50'],['event_note','Mês',$metricas['sessoes_mes'],'text-pink-700','bg-pink-50'],['groups','Pacientes',$metricas['total_pacientes'],'text-purple-700','bg-purple-50'],['medical_services','Terapeutas',$metricas['terapeutas_ativos'],'text-pink-700','bg-pink-50'],['autorenew','Ciclos ativos',$metricas['ciclos_ativos'],'text-purple-700','bg-purple-50'],['spa','Plantões hoje',$metricas['plantoes_hoje'],'text-pink-700','bg-pink-50']];foreach($cards as $c): ?>
-    <div class="glass border border-white/60 rounded-2xl p-4 hover:-translate-y-0.5 transition-transform shadow-sm">
-      <div class="flex items-center gap-1.5 mb-2">
-        <span class="material-symbols-outlined <?= $c[3] ?> p-1.5 <?= $c[4] ?> rounded-lg" style="font-size:16px"><?= $c[0] ?></span>
-        <span class="text-[10px] font-bold text-gray-500"><?= $c[1] ?></span>
-      </div>
-      <p class="text-2xl font-extrabold headline text-gray-800"><?= $c[2] ?></p>
-    </div>
-    <?php endforeach; ?>
-  </div>
-
-  <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
-    <!-- Agenda do dia -->
-    <div class="lg:col-span-8 glass border border-white/60 rounded-3xl overflow-hidden shadow-sm">
-      <div class="p-5 border-b border-gray-100 flex justify-between items-center">
-        <div><h2 class="text-base font-extrabold headline text-gray-800">Agenda do dia</h2><p class="text-xs text-gray-400">Atendimentos + plantões</p></div>
-        <span class="px-3 py-1 bg-purple-50 text-purple-700 rounded-full text-xs font-bold"><?= date('d/m/Y') ?></span>
-      </div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-left">
-          <thead class="bg-gray-50/60"><tr>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Hora</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Paciente</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Prática</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Status</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Tipo</th>
-          </tr></thead>
-          <tbody class="divide-y divide-gray-50">
-            <?php if(empty($agenda_hoje)): ?>
-            <tr><td colspan="5" class="px-5 py-8 text-center text-gray-400 text-sm">Nenhum atendimento hoje.</td></tr>
-            <?php else: ?>
-            <?php foreach($agenda_hoje as $item): $hi=substr($item['hora_inicio'],0,5); $sc=match($item['status']){'realizado'=>'bg-blue-100 text-blue-700','cancelado','faltou'=>'bg-red-100 text-red-700',default=>'bg-green-100 text-green-700'}; $st=match($item['status']){'realizado'=>'Realizado','cancelado'=>'Cancelado','faltou'=>'Faltou',default=>'Agendado'}; ?>
-            <tr class="hover:bg-purple-50/20 transition-colors">
-              <td class="px-5 py-3 font-extrabold headline text-purple-700 text-sm"><?= $hi ?></td>
-              <td class="px-5 py-3"><div class="flex items-center gap-2"><div class="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold" style="background:#f4dce4;color:#3a2c32"><?= ini($item['paciente_nome']) ?></div><span class="text-sm font-medium text-gray-800"><?= htmlspecialchars($item['paciente_nome']) ?></span></div></td>
-              <td class="px-5 py-3 text-gray-500 text-sm"><?= htmlspecialchars($item['terapia']??'—') ?></td>
-              <td class="px-5 py-3"><span class="px-2 py-0.5 text-[10px] font-bold rounded-full <?= $sc ?>"><?= $st ?></span></td>
-              <td class="px-5 py-3"><span class="px-2 py-0.5 text-[10px] font-bold rounded-full <?= $item['tipo']==='plantao'?'bg-purple-100 text-purple-700':'bg-gray-100 text-gray-500' ?>"><?= $item['tipo']==='plantao'?'Plantão':'Agendado' ?></span></td>
-            </tr>
-            <?php endforeach; endif; ?>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Coluna direita do home -->
-    <div class="lg:col-span-4 space-y-4">
-      <!-- Gráfico -->
-      <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-        <h2 class="text-sm font-extrabold headline text-gray-800 mb-4">Atendimentos — semana</h2>
-        <div class="flex items-end gap-2 h-28">
-          <?php $dias_b=[2=>'Seg',3=>'Ter',4=>'Qua',5=>'Qui',6=>'Sex']; foreach($dias_b as $d=>$nm): $v=$sessoes_semana[$d]??0; $p=$max_bar>0?round(($v/$max_bar)*100):0; ?>
-          <div class="flex-1 flex flex-col items-center gap-0.5">
-            <span class="text-[9px] font-bold text-gray-400"><?= $v ?></span>
-            <div class="w-full rounded-t-lg" style="height:<?= max(4,$p) ?>%;background:<?= $d==4?'linear-gradient(135deg,#4e0078,#b7004d)':'rgba(78,0,120,.2)' ?>;min-height:5px"></div>
-          </div>
-          <?php endforeach; ?>
+<!-- ══════════════════════════════════════
+     HEADER + NAV HORIZONTAL
+══════════════════════════════════════ -->
+<header class="fixed top-0 w-full z-50 bg-white/65 backdrop-blur-md shadow-[0_2px_20px_rgba(32,25,35,.07)]">
+  <div class="max-w-7xl mx-auto px-4 md:px-8">
+    <!-- Top row -->
+    <div class="flex items-center justify-between h-14 border-b border-outline-variant/20">
+      <span class="text-lg font-extrabold bg-gradient-to-r from-purple-700 to-pink-600 bg-clip-text text-transparent font-['Plus_Jakarta_Sans']">NUPICS</span>
+      <div class="flex items-center gap-3">
+        <!-- Plantão badge -->
+        <?php if ($plantao_aberto): ?>
+        <a href="?aba=painel#plantao"
+           class="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-600 text-white text-xs font-bold hover:opacity-90 transition-all">
+          <span class="material-symbols-outlined text-sm">local_hospital</span>
+          Plantão aberto · <?= (int)$plantao_aberto['total_atendidos'] ?>/<?= (int)$plantao_aberto['max_pacientes'] ?>
+        </a>
+        <?php endif; ?>
+        <div class="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
+          <span class="material-symbols-outlined text-primary text-base">person</span>
         </div>
-        <div class="flex justify-between mt-1"><?php foreach($dias_b as $nm): ?><span class="flex-1 text-center text-[9px] font-bold text-gray-400"><?= $nm ?></span><?php endforeach; ?></div>
-      </div>
-
-      <!-- Práticas top -->
-      <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-        <h2 class="text-sm font-extrabold headline text-gray-800 mb-3">Top práticas</h2>
-        <?php if(empty($top_praticas)): ?><p class="text-xs text-gray-400 text-center py-3">Registre plantões para ver dados.</p>
-        <?php else: ?>
-        <?php $icons=['Massoterapia'=>'dry_cleaning','Ventosaterapia'=>'air','Acupuntura'=>'spa','Reiki'=>'self_improvement','Escalda-pés'=>'water_drop']; foreach($top_praticas as $idx=>$pr): ?>
-        <div class="flex items-center justify-between mb-3">
-          <div class="flex items-center gap-2">
-            <div class="w-8 h-8 rounded-full flex items-center justify-center <?= $idx==0?'bg-purple-100 text-purple-700':($idx==1?'bg-pink-100 text-pink-700':'bg-gray-100 text-gray-500') ?>">
-              <span class="material-symbols-outlined" style="font-size:16px"><?= $icons[$pr['tipo_pratica']]??'spa' ?></span>
-            </div>
-            <div><p class="text-xs font-bold text-gray-800"><?= htmlspecialchars($pr['tipo_pratica']) ?></p><p class="text-[10px] text-gray-400"><?= $pr['total'] ?> atend.</p></div>
-          </div>
-          <span class="text-xs font-extrabold <?= $idx==0?'text-purple-700':($idx==1?'text-pink-700':'text-gray-400') ?>">#<?= $idx+1 ?></span>
-        </div>
-        <?php endforeach; endif; ?>
-      </div>
-
-      <!-- Avisos -->
-      <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-        <div class="flex justify-between items-center mb-3">
-          <h2 class="text-sm font-extrabold headline text-gray-800">Avisos internos</h2>
-          <button onclick="document.getElementById('modal-aviso').classList.add('open')" class="text-[10px] font-bold text-purple-600 hover:underline">+ Novo</button>
-        </div>
-        <?php if(empty($avisos)): ?><p class="text-xs text-gray-400 py-2 text-center">Nenhum aviso.</p>
-        <?php else: ?>
-        <?php $avc=['manutencao'=>'border-purple-400 bg-purple-50','evento'=>'border-pink-400 bg-pink-50','urgente'=>'border-red-400 bg-red-50','info'=>'border-blue-400 bg-blue-50'];$avt=['manutencao'=>'text-purple-700','evento'=>'text-pink-700','urgente'=>'text-red-700','info'=>'text-blue-700']; foreach($avisos as $av): $ac=$avc[$av['tipo']]??'border-gray-300 bg-gray-50'; $at=$avt[$av['tipo']]??'text-gray-600'; ?>
-        <div class="p-2.5 <?= $ac ?> rounded-xl border-l-4 mb-2 flex justify-between items-start">
-          <div><p class="text-[9px] font-extrabold <?= $at ?> uppercase tracking-wider mb-0.5"><?= $tipos_aviso[$av['tipo']] ?></p><p class="text-xs font-medium text-gray-800"><?= htmlspecialchars($av['texto']) ?></p></div>
-          <form method="POST" style="margin:0"><input type="hidden" name="acao" value="del_aviso"><input type="hidden" name="aviso_id" value="<?= $av['id'] ?>"><button type="submit" class="text-gray-300 hover:text-red-400 ml-1 text-xs">✕</button></form>
-        </div>
-        <?php endforeach; endif; ?>
-      </div>
-
-      <!-- Frase do dia -->
-      <div class="rounded-3xl p-5 relative overflow-hidden" style="background:linear-gradient(160deg,#fff7fc,#fde7f3)">
-        <span class="material-symbols-outlined absolute top-3 right-3 opacity-15 rotate-12" style="font-size:56px;color:#3a2c32">format_quote</span>
-        <p class="text-xs font-extrabold text-purple-500 uppercase tracking-wider mb-2">Inspiração do dia</p>
-        <p class="text-sm italic leading-relaxed text-purple-900 relative z-10"><?= htmlspecialchars($frase_hoje) ?></p>
+        <span class="hidden md:block text-sm font-semibold text-on-surface"><?= htmlspecialchars($pri) ?></span>
+        <a href="../logout.php" class="text-xs font-semibold text-on-surface-variant hover:text-secondary transition-colors">Sair</a>
       </div>
     </div>
-  </div>
-</div>
-
-<!-- ══ AGENDAMENTOS ══ -->
-<div id="aba-agenda" style="display:none">
-  <div class="mt-4 glass border border-white/60 rounded-3xl overflow-hidden shadow-sm">
-    <div class="p-5 border-b border-gray-100 flex justify-between items-center">
-      <h2 class="text-base font-extrabold headline text-gray-800">Semana atual — toda a equipe</h2>
-      <button onclick="document.getElementById('modal-plantao').classList.add('open')"
-              class="grad text-white text-xs font-bold px-4 py-2 rounded-full flex items-center gap-1">
-        <span class="material-symbols-outlined" style="font-size:14px">add</span> Registrar Plantão
-      </button>
-    </div>
-    <div class="overflow-x-auto">
-      <table class="w-full text-left">
-        <thead class="bg-gray-50/60"><tr>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Data/Hora</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Paciente</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Terapeuta</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Prática</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Status</th>
-        </tr></thead>
-        <tbody class="divide-y divide-gray-50">
-          <?php if(empty($agendamentos_semana)): ?><tr><td colspan="5" class="px-5 py-8 text-center text-gray-400 text-sm">Nenhum agendamento esta semana.</td></tr>
-          <?php else: ?>
-          <?php foreach($agendamentos_semana as $s): $hi=substr($s['hora_inicio'],0,5); $df=date('d/m',strtotime($s['data'])); $sc=match($s['status']){'realizado'=>'bg-blue-100 text-blue-700','cancelado'=>'bg-red-100 text-red-700',default=>'bg-green-100 text-green-700'}; $st=match($s['status']){'realizado'=>'Realizado','cancelado'=>'Cancelado',default=>'Agendado'}; ?>
-          <tr class="hover:bg-purple-50/20 transition-colors">
-            <td class="px-5 py-3 font-bold text-purple-700 text-sm"><?= $dias_pt[date('N',strtotime($s['data']))] ?> <?= $df ?> <?= $hi ?></td>
-            <td class="px-5 py-3"><div class="flex items-center gap-2"><div class="w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold" style="background:#f4dce4;color:#3a2c32"><?= ini($s['paciente_nome']) ?></div><span class="text-sm text-gray-800"><?= htmlspecialchars($s['paciente_nome']) ?></span></div></td>
-            <td class="px-5 py-3 text-xs text-gray-500"><?= htmlspecialchars($s['terapeuta_nome']??'A definir') ?></td>
-            <td class="px-5 py-3 text-xs text-gray-500"><?= htmlspecialchars($s['especialidade']??'—') ?></td>
-            <td class="px-5 py-3"><span class="px-2 py-0.5 text-[10px] font-bold rounded-full <?= $sc ?>"><?= $st ?></span></td>
-          </tr>
-          <?php endforeach; endif; ?>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<!-- ══ CICLOS ══ -->
-<div id="aba-ciclos" style="display:none">
-  <div class="mt-4 glass border border-white/60 rounded-3xl p-5 shadow-sm">
-    <h2 class="text-base font-extrabold headline text-gray-800 mb-4">Ciclos ativos</h2>
-    <?php if(empty($ciclos_todos)): ?><p class="text-sm text-gray-400 py-8 text-center">Nenhum ciclo ativo.</p>
-    <?php else: ?>
-    <?php foreach($ciclos_todos as $c): $f=(int)$c['feitas']; $tot=(int)$c['total_sessoes']; ?>
-    <div class="flex items-center gap-4 p-3 rounded-2xl hover:bg-purple-50/30 transition-colors mb-2 flex-wrap">
-      <div class="min-w-[160px]">
-        <div class="text-sm font-bold text-gray-800"><?= htmlspecialchars($c['paciente_nome']) ?></div>
-        <div class="text-xs text-gray-400"><?= htmlspecialchars($c['terapeuta_nome']??'—') ?> · <?= htmlspecialchars($c['especialidade']??'—') ?></div>
-      </div>
-      <div class="flex gap-1.5 flex-1">
-        <?php for($i=1;$i<=$tot;$i++): if($i<=$f)$cls='cdot-feito'; elseif($i===$f+1)$cls='cdot-prox'; else $cls='cdot-vazio'; ?>
-        <div class="ciclo-dot <?= $cls ?>"><?= $i ?></div>
-        <?php endfor; ?>
-      </div>
-      <div class="flex gap-2">
-        <form method="POST" style="margin:0"><input type="hidden" name="acao" value="estender_ciclo"><input type="hidden" name="ciclo_id" value="<?= $c['id'] ?>"><button type="submit" onclick="return confirm('Adicionar sessão?')" class="text-xs text-blue-500 hover:underline font-bold border border-blue-200 px-2 py-1 rounded-lg">+sessão</button></form>
-        <form method="POST" style="margin:0"><input type="hidden" name="acao" value="concluir_ciclo"><input type="hidden" name="ciclo_id" value="<?= $c['id'] ?>"><button type="submit" onclick="return confirm('Concluir?')" class="text-xs text-pink-500 hover:underline font-bold border border-pink-200 px-2 py-1 rounded-lg">Concluir</button></form>
-      </div>
-    </div>
-    <?php endforeach; endif; ?>
-  </div>
-</div>
-
-<!-- ══ PACIENTES ══ -->
-<div id="aba-pacientes_tab" style="display:none">
-  <div class="mt-4 glass border border-white/60 rounded-3xl overflow-hidden shadow-sm">
-    <div class="p-5 border-b border-gray-100"><h2 class="text-base font-extrabold headline text-gray-800">Todos os pacientes</h2></div>
-    <div class="overflow-x-auto">
-      <table class="w-full text-left">
-        <thead class="bg-gray-50/60"><tr>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Paciente</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Terapeuta</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Ciclo</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Sessões</th>
-          <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Ações</th>
-        </tr></thead>
-        <tbody class="divide-y divide-gray-50">
-          <?php foreach($pacientes as $i=>$p): $cor=$cores[$i%count($cores)]; $bdg=match($p['ciclo_status']??''){'ativo'=>'bg-green-100 text-green-700','concluido'=>'bg-yellow-100 text-yellow-800',default=>'bg-gray-100 text-gray-400'}; $bdt=match($p['ciclo_status']??''){'ativo'=>'Ativo','concluido'=>'Concluído',default=>'Sem ciclo'}; ?>
-          <tr class="hover:bg-purple-50/20 transition-colors">
-            <td class="px-5 py-3"><div class="flex items-center gap-2"><div class="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold" style="background:<?= $cor['bg'] ?>;color:<?= $cor['txt'] ?>"><?= ini($p['nome']) ?></div><div><div class="text-sm font-bold text-gray-800"><?= htmlspecialchars($p['nome']) ?></div><div class="text-xs text-gray-400"><?= htmlspecialchars($p['email']) ?></div></div></div></td>
-            <td class="px-5 py-3 text-xs text-gray-500"><?= $p['terapeuta_nome']?htmlspecialchars($p['terapeuta_nome']):'—' ?></td>
-            <td class="px-5 py-3"><span class="px-2 py-0.5 text-[10px] font-bold rounded-full <?= $bdg ?>"><?= $bdt ?></span></td>
-            <td class="px-5 py-3 text-xs text-gray-500"><?= $p['ciclo_status']==='ativo'?$p['sessoes_feitas'].'/'.$p['total_sessoes']:'—' ?></td>
-            <td class="px-5 py-3">
-              <?php if($p['ciclo_status']==='ativo'): ?>
-              <div class="flex gap-1">
-                <form method="POST" style="margin:0"><input type="hidden" name="acao" value="estender_ciclo"><input type="hidden" name="ciclo_id" value="<?= $p['ciclo_id'] ?>"><button type="submit" onclick="return confirm('Adicionar sessão?')" class="text-[10px] text-blue-500 hover:underline font-bold">+sess.</button></form>
-                <form method="POST" style="margin:0"><input type="hidden" name="acao" value="concluir_ciclo"><input type="hidden" name="ciclo_id" value="<?= $p['ciclo_id'] ?>"><button type="submit" onclick="return confirm('Concluir?')" class="text-[10px] text-pink-500 hover:underline font-bold ml-2">Concluir</button></form>
-              </div>
-              <?php else: ?><span class="text-gray-300 text-xs">—</span><?php endif; ?>
-            </td>
-          </tr>
-          <?php endforeach; ?>
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<!-- ══ EQUIPE ══ -->
-<div id="aba-equipe" style="display:none">
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mt-4">
-    <div class="lg:col-span-2 glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-4">Equipe de terapeutas</h2>
-      <?php foreach($terapeutas as $i=>$t): $cor=$cores[$i%count($cores)]; ?>
-      <div class="flex items-center gap-3 p-3 rounded-2xl hover:bg-purple-50/30 transition-colors mb-2">
-        <div class="w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold flex-shrink-0" style="background:<?= $cor['bg'] ?>;color:<?= $cor['txt'] ?>"><?= ini($t['nome']) ?></div>
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-bold text-gray-800"><?= htmlspecialchars($t['nome']) ?></div>
-          <div class="text-xs text-gray-400"><?= htmlspecialchars($t['especialidade']??'—') ?><?= $t['periodo']?' · '.htmlspecialchars($t['periodo']):'' ?></div>
-          <div class="text-xs text-gray-400"><?= htmlspecialchars($t['email']) ?></div>
-        </div>
-        <div class="flex-shrink-0 text-right">
-          <div class="flex gap-1 justify-end mb-1">
-            <span class="px-2 py-0.5 text-[10px] font-bold rounded-full <?= $t['ativo']?'bg-green-100 text-green-700':'bg-red-100 text-red-700' ?>"><?= $t['ativo']?'Ativo':'Inativo' ?></span>
-            <span class="px-2 py-0.5 bg-gray-100 text-gray-500 text-[10px] font-bold rounded-full"><?= $t['sessoes_mes'] ?> sess.</span>
-          </div>
-          <form method="POST" style="margin:0">
-            <?php if($t['ativo']): ?><input type="hidden" name="acao" value="desativar_terapeuta"><input type="hidden" name="terapeuta_id" value="<?= $t['id'] ?>"><button type="submit" onclick="return confirm('Desativar?')" class="text-[10px] text-red-400 hover:underline font-bold">Desativar</button>
-            <?php else: ?><input type="hidden" name="acao" value="reativar_terapeuta"><input type="hidden" name="terapeuta_id" value="<?= $t['id'] ?>"><button type="submit" class="text-[10px] text-blue-500 hover:underline font-bold">Reativar</button><?php endif; ?>
-          </form>
-        </div>
-      </div>
-      <?php endforeach; ?>
-    </div>
-    <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm h-fit">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-4">Cadastrar usuário</h2>
-      <form method="POST" class="space-y-3">
-        <input type="hidden" name="acao" value="cadastrar_usuario">
-        <select name="tipo" id="tipo-sel" required onchange="toggleCadCampos()" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"><option value="">Tipo *</option><option value="paciente">Paciente</option><option value="terapeuta">Terapeuta</option><option value="coordenador">Coordenador</option></select>
-        <input type="text" name="nome" placeholder="Nome completo *" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-        <input type="email" name="email" placeholder="E-mail *" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-        <input type="text" name="senha" placeholder="Senha inicial *" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-        <input type="text" name="telefone" placeholder="Telefone" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-        <div id="cad-ter" style="display:none" class="space-y-3"><input type="text" name="especialidade" placeholder="Especialidade" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"><input type="text" name="periodo" placeholder="Período UERN" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"></div>
-        <div id="cad-pac" style="display:none"><input type="text" name="cpf" placeholder="CPF" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"></div>
-        <button type="submit" class="w-full py-2.5 grad text-white text-sm font-bold rounded-xl hover:opacity-90">Cadastrar</button>
-      </form>
-    </div>
-  </div>
-</div>
-
-<!-- ══ GESTÃO ══ -->
-<div id="aba-gestao" style="display:none">
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-4">
-
-    <!-- Grade horária -->
-    <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-4">Grade de Horários</h2>
-      <form method="POST" class="grid grid-cols-2 gap-2 mb-4">
-        <input type="hidden" name="acao" value="add_horario">
-        <select name="dia_semana" required class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"><option value="">Dia</option><?php foreach($dias_sel as $v=>$l): ?><option value="<?= $v ?>"><?= $l ?></option><?php endforeach; ?></select>
-        <select name="hora_inicio" required class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"><option value="">Hora</option><?php for($h=7;$h<=20;$h++):foreach(['00','30'] as $m):$v=sprintf('%02d:%02d',$h,$m); ?><option value="<?= $v ?>"><?= $v ?></option><?php endforeach;endfor; ?></select>
-        <select name="duracao" class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"><option value="30">30 min</option><option value="45">45 min</option><option value="60">60 min</option></select>
-        <select name="vagas" class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"><?php for($v=1;$v<=8;$v++): ?><option value="<?= $v ?>" <?= $v==4?'selected':'' ?>><?= $v ?> vaga<?= $v!=1?'s':'' ?></option><?php endfor; ?></select>
-        <button type="submit" class="col-span-2 grad text-white text-sm font-bold py-2 rounded-xl">+ Adicionar horário</button>
-      </form>
-      <?php foreach($todos_horarios as $h): $hi=substr($h['hora_inicio'],0,5);$hf=date('H:i',strtotime($h['hora_inicio'])+$h['duracao_minutos']*60); ?>
-      <div class="flex items-center justify-between py-2 border-b border-gray-50 text-sm <?= !$h['ativo']?'opacity-40':'' ?>">
-        <span class="font-bold text-purple-700"><?= $dias_sel[$h['dia_semana']]??'' ?> <?= $hi ?>–<?= $hf ?></span>
-        <div class="flex items-center gap-3">
-          <form method="POST" style="display:flex;align-items:center;gap:4px;margin:0">
-            <input type="hidden" name="acao" value="editar_vagas"><input type="hidden" name="horario_id" value="<?= $h['id'] ?>">
-            <select name="vagas" class="text-xs border border-gray-200 rounded-lg px-1.5 py-1 focus:outline-none"><?php for($v=1;$v<=8;$v++): ?><option value="<?= $v ?>" <?= $v==$h['vagas_total']?'selected':'' ?>><?= $v ?>v</option><?php endfor; ?></select>
-            <button type="submit" class="text-[10px] text-blue-500 hover:underline font-bold">Salvar</button>
-          </form>
-          <form method="POST" style="margin:0"><input type="hidden" name="acao" value="toggle_horario"><input type="hidden" name="horario_id" value="<?= $h['id'] ?>"><input type="hidden" name="estado" value="<?= $h['ativo']?0:1 ?>"><button type="submit" onclick="return confirm('<?= $h['ativo']?'Desativar':'Reativar' ?>?')" class="text-[10px] <?= $h['ativo']?'text-red-400':'text-green-500' ?> hover:underline font-bold"><?= $h['ativo']?'Desativar':'Reativar' ?></button></form>
-        </div>
-      </div>
-      <?php endforeach; ?>
-    </div>
-
-    <!-- Visitas externas -->
-    <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-4">Visitas Externas</h2>
+    <!-- Nav tabs row -->
+    <div class="flex items-center gap-1 overflow-x-auto py-2 no-scrollbar">
       <?php
-      $pend_v=count(array_filter($visitas,fn($v)=>$v['status']==='pendente'));
-      $aprov_v=count(array_filter($visitas,fn($v)=>$v['status']==='aprovada'));
-      $real_v=count(array_filter($visitas,fn($v)=>$v['status']==='realizada'));
-      ?>
-      <div class="grid grid-cols-3 gap-2 mb-4">
-        <div class="text-center p-2 bg-yellow-50 rounded-xl"><div class="text-lg font-extrabold text-yellow-700"><?= $pend_v ?></div><div class="text-[9px] font-bold text-yellow-600 uppercase">Pendentes</div></div>
-        <div class="text-center p-2 bg-blue-50 rounded-xl"><div class="text-lg font-extrabold text-blue-700"><?= $aprov_v ?></div><div class="text-[9px] font-bold text-blue-600 uppercase">Aprovadas</div></div>
-        <div class="text-center p-2 bg-green-50 rounded-xl"><div class="text-lg font-extrabold text-green-700"><?= $real_v ?></div><div class="text-[9px] font-bold text-green-600 uppercase">Realizadas</div></div>
+      $nav_tabs = [
+        'painel'     => ['icon'=>'dashboard',     'label'=>'Painel'],
+        'cronograma' => ['icon'=>'calendar_month', 'label'=>'Cronograma'],
+        'pacientes'  => ['icon'=>'group',          'label'=>'Pacientes'],
+        'terapeutas' => ['icon'=>'medical_services','label'=>'Terapeutas'],
+        'protocolos' => ['icon'=>'description',    'label'=>'Protocolos'],
+        'perfil'     => ['icon'=>'manage_accounts','label'=>'Perfil'],
+      ];
+      foreach ($nav_tabs as $k=>$t): ?>
+      <a href="?aba=<?= $k ?>" class="nav-tab <?= $aba===$k?'active':'' ?>">
+        <span class="material-symbols-outlined"><?= $t['icon'] ?></span>
+        <?= $t['label'] ?>
+      </a>
+      <?php endforeach; ?>
+    </div>
+  </div>
+</header>
+
+<!-- ══════════════════════════════════════
+     CONTEÚDO
+══════════════════════════════════════ -->
+<main class="flex-grow pt-[112px] pb-16 px-4 md:px-8 max-w-7xl mx-auto w-full">
+
+<?php if ($aba === 'painel'): ?>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+  <!-- COLUNA ESQUERDA (2/3) -->
+  <div class="lg:col-span-2 space-y-7">
+
+    <!-- Hero -->
+    <div>
+      <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-1"><?= strftime('%A, %d de %B', time()) ?></p>
+      <h1 class="text-3xl md:text-4xl font-extrabold text-primary tracking-tight mb-1">Olá, <?= htmlspecialchars($pri) ?>! 🌿</h1>
+      <p class="text-sm text-on-surface-variant italic max-w-xl leading-relaxed">
+        <?= htmlspecialchars(strip_tags($frase)) ?>
+        <?php if ($frase_autor): ?><span class="not-italic text-outline"> — <?= htmlspecialchars($frase_autor) ?></span><?php endif; ?>
+      </p>
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <?php
+      $st_cards = [
+        ['label'=>'Ciclos ativos','val'=>$stats['ciclos_ativos'],'cor'=>'border-l-primary','txt'=>'text-primary'],
+        ['label'=>'Concluídos','val'=>$stats['total_concluidos'],'cor'=>'border-l-emerald-500','txt'=>'text-emerald-700'],
+        ['label'=>'Pendentes','val'=>$stats['pendentes_hoje'],'cor'=>'border-l-amber-500','txt'=>'text-amber-700'],
+        ['label'=>'Meus slots','val'=>$stats['total_slots'],'cor'=>'border-l-indigo-500','txt'=>'text-indigo-700'],
+      ];
+      foreach ($st_cards as $sc): ?>
+      <div class="glass rounded-2xl p-4 border-l-4 <?= $sc['cor'] ?>">
+        <p class="text-[10px] font-bold uppercase tracking-widest <?= $sc['txt'] ?>/60 mb-0.5"><?= $sc['label'] ?></p>
+        <p class="text-3xl font-extrabold <?= $sc['txt'] ?>"><?= $sc['val'] ?></p>
       </div>
-      <?php if(empty($visitas)): ?><p class="text-xs text-gray-400 text-center py-4">Nenhuma solicitação.</p>
-      <?php else: ?>
-      <?php $si=['aprovada'=>'bg-blue-100 text-blue-700','realizada'=>'bg-green-100 text-green-700','cancelada'=>'bg-red-100 text-red-700']; foreach($visitas as $v): $sc=$si[$v['status']]??'bg-yellow-100 text-yellow-700'; ?>
-      <div class="flex items-start justify-between py-3 border-b border-gray-50 gap-2">
-        <div class="flex-1 min-w-0">
-          <div class="text-sm font-bold text-gray-800 truncate"><?= htmlspecialchars($v['local_nome']) ?></div>
-          <div class="text-xs text-gray-400"><?= htmlspecialchars($v['solicitante_nome']) ?> · <?= $tipos_visita[$v['local_tipo']]??$v['local_tipo'] ?><?= $v['data_sugerida']?' · '.date('d/m/Y',strtotime($v['data_sugerida'])):'' ?></div>
-          <?php if($v['observacao']): ?><div class="text-xs text-gray-500 mt-1 bg-gray-50 rounded-lg p-2"><?= htmlspecialchars($v['observacao']) ?></div><?php endif; ?>
+      <?php endforeach; ?>
+    </div>
+
+    <!-- Plantão hoje -->
+    <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-emerald-600">local_hospital</span>
+          <h2 class="font-headline font-bold text-on-surface">Plantão de hoje</h2>
         </div>
-        <form method="POST" class="flex items-center gap-1 flex-shrink-0" style="margin:0">
-          <input type="hidden" name="acao" value="status_visita"><input type="hidden" name="visita_id" value="<?= $v['id'] ?>">
-          <select name="novo_status" class="text-[10px] border border-gray-200 rounded-lg px-1.5 py-1 focus:outline-none"><?php foreach(['pendente','aprovada','realizada','cancelada'] as $s): ?><option value="<?= $s ?>" <?= $v['status']===$s?'selected':'' ?>><?= ucfirst($s) ?></option><?php endforeach; ?></select>
-          <button type="submit" class="text-[10px] text-purple-600 hover:underline font-bold">Ok</button>
-        </form>
+        <?php if (!$plantao_aberto): ?>
+        <button onclick="abrirModal('modal-plantao-novo')"
+          class="flex items-center gap-1.5 px-4 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90 active:scale-95 transition-all">
+          <span class="material-symbols-outlined text-sm">add_circle</span>Iniciar plantão
+        </button>
+        <?php endif; ?>
+      </div>
+
+      <?php if ($plantao_aberto):
+        $pct = $plantao_aberto['max_pacientes'] > 0
+          ? round(($plantao_aberto['total_atendidos'] / $plantao_aberto['max_pacientes']) * 100) : 0;
+      ?>
+      <div class="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 mb-4">
+        <div class="flex items-center gap-4 mb-3">
+          <div class="text-center"><p class="text-2xl font-extrabold text-emerald-700"><?= (int)$plantao_aberto['total_atendidos'] ?></p><p class="text-xs text-emerald-600">atendidos</p></div>
+          <div class="text-center"><p class="text-2xl font-extrabold text-emerald-700"><?= (int)$plantao_aberto['max_pacientes'] ?></p><p class="text-xs text-emerald-600">limite</p></div>
+          <div class="flex-grow h-2 rounded-full bg-emerald-200 overflow-hidden">
+            <div class="h-full bg-emerald-500 rounded-full transition-all" style="width:<?= $pct ?>%"></div>
+          </div>
+          <span class="text-xs font-bold text-emerald-700"><?= $plantao_aberto['hora_inicio'] ?> – <?= $plantao_aberto['hora_fim'] ?></span>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="abrirModal('modal-plantao-ativo')"
+            class="flex-grow flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-full bg-emerald-600 text-white text-sm font-bold hover:opacity-90 transition-all">
+            <span class="material-symbols-outlined text-sm">person_add</span>Registrar atendimento
+          </button>
+          <button onclick="encerrarPlantao(<?= (int)$plantao_aberto['id'] ?>)"
+            class="px-4 py-2.5 rounded-full border-2 border-emerald-300 text-emerald-700 text-sm font-bold hover:bg-emerald-50 transition-all">Encerrar</button>
+        </div>
+      </div>
+      <?php else: ?>
+      <p class="text-sm text-on-surface-variant text-center py-4">Nenhum plantão aberto. Clique em "Iniciar plantão" quando for atender.</p>
+      <?php endif; ?>
+
+      <!-- Últimos do plantão -->
+      <?php
+      $ult_plt = $pdo->prepare("SELECT paciente_nome, tipo_pratica, queixa, criado_em FROM sessoes_plantao WHERE terapeuta_id=? ORDER BY criado_em DESC LIMIT 5");
+      $ult_plt->execute([$uid]); $ult_plt = $ult_plt->fetchAll(PDO::FETCH_ASSOC);
+      if (!empty($ult_plt)): ?>
+      <div class="border-t border-outline-variant/20 pt-4 space-y-2">
+        <p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-2">Últimos atendimentos</p>
+        <?php foreach ($ult_plt as $u): ?>
+        <div class="flex items-center justify-between bg-surface-container-low/60 rounded-xl px-3 py-2 border border-outline-variant/15">
+          <div class="min-w-0">
+            <p class="text-xs font-bold text-on-surface truncate"><?= htmlspecialchars($u['paciente_nome']) ?></p>
+            <p class="text-[10px] text-on-surface-variant truncate"><?= htmlspecialchars($u['tipo_pratica']) ?></p>
+          </div>
+          <span class="text-[10px] text-outline shrink-0 ml-3"><?= date('d/m H:i', strtotime($u['criado_em'])) ?></span>
+        </div>
+        <?php endforeach; ?>
+      </div>
+      <?php endif; ?>
+    </div>
+
+    <!-- Ciclos ativos (resumo) -->
+    <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="font-headline font-bold text-on-surface">Meus ciclos ativos</h2>
+        <a href="?aba=cronograma" class="text-xs font-bold text-primary hover:underline">Ver cronograma →</a>
+      </div>
+      <?php if (empty($ciclos)): ?>
+      <p class="text-sm text-on-surface-variant text-center py-6">Nenhum ciclo ativo no momento.</p>
+      <?php else: foreach ($ciclos as $cic):
+        $prox=(int)$cic['proxima_sessao']; $total=(int)$cic['total_sessoes']; $feitas=(int)$cic['sessoes_feitas'];
+      ?>
+      <div class="card-h rounded-2xl p-4 mb-3 border border-outline-variant/20 bg-surface-container-low/50">
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+          <div class="flex-grow min-w-0">
+            <div class="flex flex-wrap items-center gap-2 mb-1.5">
+              <span class="font-bold text-sm text-on-surface"><?= htmlspecialchars($cic['pnome']) ?></span>
+              <?php if ((int)$cic['faltas']>0): ?>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full <?= $cic['faltas']>=2?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700' ?>"><?= $cic['faltas'] ?> falta<?= $cic['faltas']>1?'s':'' ?></span>
+              <?php endif; ?>
+            </div>
+            <p class="text-xs text-on-surface-variant mb-2"><?= $dias_full[(int)$cic['dia_semana']] ?> · <?= substr($cic['hora_inicio'],0,5) ?>–<?= substr($cic['hora_fim'],0,5) ?></p>
+            <div class="flex items-center gap-1.5">
+              <?php for($i=1;$i<=$total;$i++): $d=$i<=$feitas; $c=$i===$prox; ?>
+              <div class="pdot <?= $d?'done':($c?'curr':'idle') ?>"><?= $d?'✓':$i ?></div>
+              <?php if($i<$total): ?><div class="w-3 h-0.5 rounded-full <?= $d?'bg-primary':'bg-outline-variant' ?>"></div><?php endif; ?>
+              <?php endfor; ?>
+              <span class="ml-1.5 text-xs text-on-surface-variant"><?= $feitas ?>/<?= $total ?></span>
+            </div>
+          </div>
+          <div class="flex flex-col gap-1.5 shrink-0">
+            <?php if ($prox<=$total): ?>
+            <a href="sessao.php?ciclo_id=<?= $cic['ciclo_id'] ?>"
+              class="flex items-center justify-center gap-1 px-3 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90">
+              <span class="material-symbols-outlined text-sm">edit_note</span>
+              <?= $prox===1?'Anamnese':("S{$prox}") ?>
+            </a>
+            <?php endif; ?>
+            <button onclick="abrirAdiar(<?= $cic['ciclo_id'] ?>,<?= $prox ?>,'<?= addslashes($cic['pnome']) ?>')"
+              class="flex items-center justify-center gap-1 px-3 py-2 rounded-full border border-amber-200 text-amber-700 text-xs font-bold hover:bg-amber-50">
+              <span class="material-symbols-outlined text-sm">event_busy</span>Adiar
+            </button>
+            <button onclick="abrirFaltou(<?= $cic['ciclo_id'] ?>,<?= $prox ?>,<?= $cic['faltas'] ?>,'<?= addslashes($cic['pnome']) ?>')"
+              class="flex items-center justify-center gap-1 px-3 py-2 rounded-full border border-red-200 text-red-600 text-xs font-bold hover:bg-red-50">
+              <span class="material-symbols-outlined text-sm">person_off</span>Faltou
+            </button>
+          </div>
+        </div>
+      </div>
+      <?php endforeach; endif; ?>
+      <?php if (count($ciclos)>=5): ?>
+      <a href="?aba=cronograma" class="block text-center text-xs font-bold text-primary hover:underline mt-2">Ver todos os ciclos →</a>
+      <?php endif; ?>
+    </div>
+
+    <!-- Pendentes -->
+    <?php if (!empty($pendentes)): ?>
+    <div class="glass rounded-2xl p-5 border border-amber-200/50">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="material-symbols-outlined text-amber-500">pending_actions</span>
+        <h2 class="font-headline font-bold text-on-surface">Confirmações pendentes (<?= count($pendentes) ?>)</h2>
+      </div>
+      <div class="space-y-2.5">
+        <?php foreach ($pendentes as $r): ?>
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3 bg-amber-50/60 rounded-xl px-4 py-3 border border-amber-100">
+          <div class="flex-grow min-w-0">
+            <p class="font-bold text-sm text-on-surface"><?= htmlspecialchars($r['pnome']) ?></p>
+            <p class="text-xs text-on-surface-variant"><?= $dias_full[(int)$r['dia_semana']] ?> · <?= substr($r['hora_inicio'],0,5) ?>–<?= substr($r['hora_fim'],0,5) ?></p>
+            <?php if ($r['queixas']): ?><p class="text-xs text-on-surface-variant mt-0.5 truncate">"<?= htmlspecialchars($r['queixas']) ?>"</p><?php endif; ?>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button onclick="confirmarRes(<?= $r['id'] ?>,this)" class="px-3 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90">Confirmar</button>
+            <button onclick="recusarRes(<?= $r['id'] ?>,this)" class="px-3 py-2 rounded-full border-2 border-outline-variant text-on-surface-variant text-xs font-bold hover:bg-surface-container-high">Recusar</button>
+          </div>
+        </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Estatísticas -->
+    <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+      <div class="flex items-center gap-2 mb-5">
+        <span class="material-symbols-outlined text-primary">bar_chart</span>
+        <h2 class="font-headline font-bold text-on-surface">Estatísticas</h2>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        <div>
+          <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-3">Meu desempenho</p>
+          <?php foreach ([['Ciclos concluídos',$stats['total_concluidos'],max(1,(int)$stats['total_concluidos'])],['Ciclos ativos',$stats['ciclos_ativos'],max(1,(int)$stats['ciclos_ativos'])],['Atendimentos plantão',$stats['plantoes_total'],max(1,(int)$stats['plantoes_total'])]] as [$l,$v,$m]): $p=min(100,round(($v/$m)*100)); ?>
+          <div class="mb-2.5"><div class="flex justify-between text-xs mb-1"><span class="text-on-surface-variant"><?= $l ?></span><span class="font-bold text-primary"><?= $v ?></span></div>
+          <div class="h-1.5 rounded-full bg-surface-container-highest overflow-hidden"><div class="h-full stat-bar" style="width:<?= $p ?>%"></div></div></div>
+          <?php endforeach; ?>
+        </div>
+        <div>
+          <p class="text-xs font-bold uppercase tracking-widest text-primary/50 mb-3">Projeto NUPICS</p>
+          <?php foreach ([['Pacientes atendidos',$stats_gerais['pac_atend']],['Ciclos concluídos',$stats_gerais['ciclos_conc']],['Ciclos ativos',$stats_gerais['ciclos_atv']],['Plantões realizados',$stats_gerais['plt_total']],['Pacientes cadastrados',$stats_gerais['pac_cad']]] as [$l,$v]): ?>
+          <div class="flex justify-between items-center py-1.5 border-b border-outline-variant/15 last:border-0">
+            <span class="text-xs text-on-surface-variant"><?= $l ?></span>
+            <span class="text-sm font-extrabold text-primary"><?= $v ?></span>
+          </div>
+          <?php endforeach; ?>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /col left -->
+
+  <!-- COLUNA DIREITA (1/3) -->
+  <div class="space-y-5">
+
+    <!-- Avisos -->
+    <div class="glass rounded-2xl p-5 border border-primary/10">
+      <div class="flex items-center gap-2 mb-4"><span class="material-symbols-outlined text-primary">campaign</span><h3 class="font-headline font-bold text-on-surface">Avisos</h3></div>
+      <?php if (empty($avisos)): ?>
+      <p class="text-sm text-on-surface-variant text-center py-3">Nenhum aviso.</p>
+      <?php else:
+        $av_ic=['evento'=>'event','urgente'=>'warning','manutencao'=>'build','info'=>'info'];
+        $av_cor=['evento'=>'text-primary','urgente'=>'text-secondary','manutencao'=>'text-amber-600','info'=>'text-blue-600'];
+        foreach ($avisos as $av): ?>
+      <div class="av-<?= $av['tipo'] ?> bg-white/60 rounded-xl px-4 py-3 mb-2 last:mb-0">
+        <div class="flex items-start gap-2">
+          <span class="material-symbols-outlined text-sm mt-0.5 shrink-0 <?= $av_cor[$av['tipo']]??'text-primary' ?>"><?= $av_ic[$av['tipo']]??'info' ?></span>
+          <div><p class="text-xs font-bold text-on-surface"><?= htmlspecialchars($av['titulo']) ?></p>
+          <p class="text-xs text-on-surface-variant mt-0.5 leading-relaxed"><?= htmlspecialchars($av['texto']) ?></p>
+          <p class="text-[10px] text-outline mt-1"><?= date('d/m/Y', strtotime($av['criado_em'])) ?></p></div>
+        </div>
       </div>
       <?php endforeach; endif; ?>
     </div>
 
-    <!-- Histórico plantões -->
-    <div class="lg:col-span-2 glass border border-white/60 rounded-3xl overflow-hidden shadow-sm">
-      <div class="p-5 border-b border-gray-100"><h2 class="text-base font-extrabold headline text-gray-800">Histórico de Plantões</h2></div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-left">
-          <thead class="bg-gray-50/60"><tr>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Data/Hora</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Paciente</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Terapeuta</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Prática</th>
-            <th class="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-gray-400">Cadastrado?</th>
-          </tr></thead>
-          <tbody class="divide-y divide-gray-50">
-            <?php if(empty($historico_plantoes)): ?><tr><td colspan="5" class="px-5 py-6 text-center text-gray-400 text-sm">Nenhum plantão registrado.</td></tr>
-            <?php else: ?>
-            <?php foreach($historico_plantoes as $sp): $dt=date('d/m/Y',strtotime($sp['data'])); $hi=substr($sp['hora_inicio'],0,5); ?>
-            <tr class="hover:bg-purple-50/20 transition-colors">
-              <td class="px-5 py-3 font-bold text-purple-700 text-xs"><?= $dt ?> <?= $hi ?></td>
-              <td class="px-5 py-3"><div class="flex items-center gap-2"><div class="w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold" style="background:#f4dce4;color:#3a2c32"><?= ini($sp['paciente_nome']) ?></div><span class="text-xs font-medium text-gray-800"><?= htmlspecialchars($sp['paciente_nome']) ?></span></div></td>
-              <td class="px-5 py-3 text-xs text-gray-500"><?= htmlspecialchars($sp['terapeuta_nome']) ?></td>
-              <td class="px-5 py-3 text-xs text-gray-500"><?= htmlspecialchars($sp['tipo_pratica']) ?></td>
-              <td class="px-5 py-3"><span class="px-2 py-0.5 text-[9px] font-bold rounded-full <?= $sp['paciente_id']?'bg-green-100 text-green-700':'bg-gray-100 text-gray-400' ?>"><?= $sp['paciente_id']?'Sim — no histórico':'Não cadastrado' ?></span></td>
-            </tr>
-            <?php endforeach; endif; ?>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- ══ CONTEÚDO (frases + playlists) ══ -->
-<div id="aba-conteudo" style="display:none">
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-4">
-
-    <!-- Frases dos pacientes -->
-    <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-1">Frases para pacientes</h2>
-      <p class="text-xs text-gray-400 mb-4">Aparecem rotativamente no dashboard do paciente.</p>
-      <form method="POST" class="flex gap-2 mb-4">
-        <input type="hidden" name="acao" value="add_frase">
-        <input type="hidden" name="frase_tipo" value="paciente">
-        <input type="text" name="frase_texto" placeholder="Nova frase inspiradora..." required class="flex-1 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400">
-        <button type="submit" class="grad text-white text-xs font-bold px-4 py-2 rounded-xl whitespace-nowrap">Adicionar</button>
-      </form>
-      <div class="space-y-2 max-h-80 overflow-y-auto pr-1">
-        <?php foreach($frases_paciente as $fr): ?>
-        <div class="flex items-start gap-2 p-3 bg-pink-50/60 rounded-xl border border-pink-100">
-          <p class="text-sm italic text-gray-700 flex-1 leading-relaxed"><?= htmlspecialchars($fr['texto']) ?></p>
-          <form method="POST" style="margin:0;flex-shrink:0">
-            <input type="hidden" name="acao" value="del_frase">
-            <input type="hidden" name="frase_id" value="<?= $fr['id'] ?>">
-            <button type="submit" onclick="return confirm('Remover frase?')" class="text-gray-300 hover:text-red-400 text-xs">✕</button>
-          </form>
-        </div>
+    <!-- Playlists -->
+    <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+      <div class="flex items-center gap-2 mb-4"><div class="p-1.5 bg-primary rounded-lg text-white"><span class="material-symbols-outlined text-sm">graphic_eq</span></div><h3 class="font-headline font-bold text-on-surface text-sm">Ambiente terapêutico</h3></div>
+      <div class="flex flex-wrap gap-2">
+        <?php foreach ($playlists as $pl):
+          preg_match('/(?:v=|youtu\.be\/)([A-Za-z0-9_\-]{11})/', $pl['url'], $m2); $ytid=$m2[1]??'';
+        ?>
+        <button onclick="abrirPlaylist('<?= htmlspecialchars($ytid) ?>','<?= htmlspecialchars($pl['nome'],ENT_QUOTES) ?>')"
+          class="flex items-center gap-1.5 px-3 py-2 rounded-full glass border border-outline-variant/30 hover:border-primary/40 hover:bg-primary/5 transition-all text-xs font-medium">
+          <?= $pl['emoji'] ?> <?= htmlspecialchars($pl['nome']) ?>
+          <span class="material-symbols-outlined text-xs text-primary/60">play_circle</span>
+        </button>
         <?php endforeach; ?>
-        <?php if(empty($frases_paciente)): ?><p class="text-xs text-gray-400 text-center py-4">Nenhuma frase cadastrada.</p><?php endif; ?>
       </div>
     </div>
 
-    <!-- Frases dos terapeutas -->
-    <div class="glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-1">Frases para terapeutas</h2>
-      <p class="text-xs text-gray-400 mb-4">Aparecem rotativamente no dashboard do terapeuta.</p>
-      <form method="POST" class="flex gap-2 mb-4">
-        <input type="hidden" name="acao" value="add_frase">
-        <input type="hidden" name="frase_tipo" value="terapeuta">
-        <input type="text" name="frase_texto" placeholder="Nova frase inspiradora..." required class="flex-1 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400">
-        <button type="submit" class="grad text-white text-xs font-bold px-4 py-2 rounded-xl whitespace-nowrap">Adicionar</button>
-      </form>
-      <div class="space-y-2 max-h-80 overflow-y-auto pr-1">
-        <?php foreach($frases_terapeuta as $fr): ?>
-        <div class="flex items-start gap-2 p-3 bg-purple-50/60 rounded-xl border border-purple-100">
-          <p class="text-sm italic text-gray-700 flex-1 leading-relaxed"><?= htmlspecialchars($fr['texto']) ?></p>
-          <form method="POST" style="margin:0;flex-shrink:0">
-            <input type="hidden" name="acao" value="del_frase">
-            <input type="hidden" name="frase_id" value="<?= $fr['id'] ?>">
-            <button type="submit" onclick="return confirm('Remover frase?')" class="text-gray-300 hover:text-red-400 text-xs">✕</button>
-          </form>
-        </div>
-        <?php endforeach; ?>
-        <?php if(empty($frases_terapeuta)): ?><p class="text-xs text-gray-400 text-center py-4">Nenhuma frase cadastrada.</p><?php endif; ?>
-      </div>
-    </div>
-
-    <!-- Playlists terapêuticas -->
-    <div class="lg:col-span-2 glass border border-white/60 rounded-3xl p-5 shadow-sm">
-      <h2 class="text-base font-extrabold headline text-gray-800 mb-1">Playlists terapêuticas</h2>
-      <p class="text-xs text-gray-400 mb-4">Aparecem no ambiente terapêutico do portal do paciente e do terapeuta.</p>
-      <form method="POST" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-        <input type="hidden" name="acao" value="add_playlist">
-        <input type="text" name="pl_emoji" placeholder="Emoji (ex: 🌿)" class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400">
-        <input type="text" name="pl_nome" placeholder="Nome da playlist *" required class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400">
-        <input type="url" name="pl_url" placeholder="URL do YouTube *" required class="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400">
-        <button type="submit" class="grad text-white text-sm font-bold rounded-xl hover:opacity-90">+ Adicionar</button>
-      </form>
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-        <?php foreach($playlists_db as $pl): ?>
-        <div class="flex items-center gap-3 p-3 bg-purple-50/50 border border-purple-100 rounded-2xl">
-          <span class="text-2xl"><?= $pl['emoji'] ?></span>
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-bold text-gray-800"><?= htmlspecialchars($pl['nome']) ?></div>
-            <a href="<?= htmlspecialchars($pl['url']) ?>" target="_blank" class="text-xs text-purple-500 hover:underline truncate block">Abrir no YouTube ↗</a>
+    <!-- Atividade recente -->
+    <?php if (!empty($atividade)): ?>
+    <div class="glass rounded-2xl p-5 border border-outline-variant/20">
+      <div class="flex items-center gap-2 mb-4"><span class="material-symbols-outlined text-secondary">history</span><h3 class="font-headline font-bold text-on-surface">Atividade recente</h3></div>
+      <div class="space-y-2.5">
+        <?php foreach ($atividade as $at): $isCiclo=$at['tipo']==='ciclo'; ?>
+        <div class="flex items-start gap-2.5">
+          <div class="w-7 h-7 rounded-full flex items-center justify-center shrink-0 <?= $isCiclo?'bg-indigo-100 text-indigo-600':'bg-emerald-100 text-emerald-600' ?>">
+            <span class="material-symbols-outlined text-xs"><?= $isCiclo?'verified':'local_hospital' ?></span>
           </div>
-          <form method="POST" style="margin:0">
-            <input type="hidden" name="acao" value="del_playlist">
-            <input type="hidden" name="playlist_id" value="<?= $pl['id'] ?>">
-            <button type="submit" onclick="return confirm('Remover playlist?')" class="text-gray-300 hover:text-red-400 text-xs">✕</button>
-          </form>
+          <div class="flex-grow min-w-0">
+            <p class="text-xs font-bold text-on-surface truncate"><?= htmlspecialchars($at['envolvido']) ?></p>
+            <p class="text-[10px] text-on-surface-variant"><?= $isCiclo?'Ciclo concluído':'Plantão: '.htmlspecialchars($at['extra']??'') ?></p>
+          </div>
+          <span class="text-[10px] text-outline shrink-0"><?= date('d/m', strtotime($at['dt'])) ?></span>
         </div>
         <?php endforeach; ?>
-        <?php if(empty($playlists_db)): ?><p class="text-xs text-gray-400 col-span-3 text-center py-4">Nenhuma playlist cadastrada.</p><?php endif; ?>
       </div>
     </div>
+    <?php endif; ?>
 
+    <!-- NUPICS info -->
+    <div class="bg-gradient-to-br from-primary to-secondary p-5 rounded-2xl text-white relative overflow-hidden">
+      <div class="relative z-10 space-y-2">
+        <h3 class="text-base font-extrabold">NUPICS Caicó</h3>
+        <p class="text-purple-100 text-xs leading-relaxed">Práticas integrativas gratuitas para a comunidade. Campus UERN, Caicó/RN.</p>
+      </div>
+      <span class="material-symbols-outlined absolute -bottom-2 -right-2 text-[72px] text-white/10">eco</span>
+    </div>
+
+  </div><!-- /col right -->
+</div>
+
+<?php elseif ($aba === 'cronograma'): ?>
+
+<div class="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+  <div>
+    <h1 class="text-2xl font-extrabold text-primary">Cronograma semanal</h1>
+    <p class="text-sm text-on-surface-variant">Gerencie seus horários e acompanhe seus ciclos.</p>
+  </div>
+  <div class="flex gap-3">
+    <?php if ($plantao_aberto): ?>
+    <button onclick="abrirModal('modal-plantao-ativo')"
+      class="flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-emerald-600 text-white text-sm font-bold hover:opacity-90 transition-all">
+      <span class="material-symbols-outlined text-sm">local_hospital</span>Registrar atendimento
+    </button>
+    <?php else: ?>
+    <button onclick="abrirModal('modal-plantao-novo')"
+      class="flex items-center gap-1.5 px-5 py-2.5 rounded-full border-2 border-emerald-400 text-emerald-700 text-sm font-bold hover:bg-emerald-50 transition-all">
+      <span class="material-symbols-outlined text-sm">local_hospital</span>Iniciar plantão
+    </button>
+    <?php endif; ?>
+    <button onclick="abrirModal('modal-novo-slot')"
+      class="flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-primary text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all">
+      <span class="material-symbols-outlined text-sm">add</span>Novo horário
+    </button>
   </div>
 </div>
+
+<!-- Stats rápidos do cronograma -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-7">
+  <?php
+  $hoje_count = $pdo->prepare("SELECT COUNT(*) FROM reservas r JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=? AND r.status='confirmado' AND r.data_sessao=CURDATE()");
+  $hoje_count->execute([$uid]); $hoje_n = $hoje_count->fetchColumn();
+  $semana_count = $pdo->prepare("SELECT COUNT(*) FROM reservas r JOIN slots s ON r.slot_id=s.id WHERE s.terapeuta_id=? AND r.status='confirmado' AND r.data_sessao BETWEEN CURDATE() AND DATE_ADD(CURDATE(),INTERVAL 7 DAY)");
+  $semana_count->execute([$uid]); $semana_n = $semana_count->fetchColumn();
+  $fila_count = $pdo->prepare("SELECT COUNT(*) FROM fila_espera fe JOIN slots s ON fe.slot_id=s.id WHERE s.terapeuta_id=? AND fe.status='aguardando'");
+  $fila_count->execute([$uid]); $fila_n = $fila_count->fetchColumn();
+  $cards_cron=[
+    ['Atendimentos hoje',$hoje_n,'calendar_today','text-primary','bg-primary/5'],
+    ['Próximos 7 dias',$semana_n,'date_range','text-indigo-700','bg-indigo-50'],
+    ['Na fila de espera',$fila_n,'queue','text-amber-700','bg-amber-50'],
+    ['Horários ativos',count($meus_slots),'schedule','text-emerald-700','bg-emerald-50'],
+  ];
+  foreach ($cards_cron as [$l,$v,$ic,$tc,$bc]): ?>
+  <div class="glass rounded-2xl p-4 <?= $bc ?> border border-outline-variant/20">
+    <div class="flex items-center justify-between mb-1">
+      <p class="text-xs font-bold uppercase tracking-widest <?= $tc ?>/60"><?= $l ?></p>
+      <span class="material-symbols-outlined <?= $tc ?> text-lg"><?= $ic ?></span>
+    </div>
+    <p class="text-3xl font-extrabold <?= $tc ?>"><?= $v ?></p>
+  </div>
+  <?php endforeach; ?>
+</div>
+
+<!-- Grade do cronograma estilo Stitch -->
+<div class="glass rounded-2xl overflow-hidden border border-outline-variant/20 mb-7">
+  <!-- Header da grade -->
+  <div class="grid border-b border-outline-variant/20 bg-surface-container-low/60" style="grid-template-columns:80px repeat(5,1fr)">
+    <div class="p-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant text-center">Horário</div>
+    <?php foreach ($dias_full as $d): ?>
+    <div class="p-3 text-center font-bold text-on-surface text-sm border-l border-outline-variant/20"><?= $d ?></div>
+    <?php endforeach; ?>
+  </div>
+
+  <?php
+  // Agrupa slots por hora
+  $por_hora = [];
+  foreach ($meus_slots as $sl) {
+      $h = substr($sl['hora_inicio'],0,5);
+      $por_hora[$h][$sl['dia_semana']] = $sl;
+  }
+  ksort($por_hora);
+
+  // Gera horários de 07:00 a 18:00 a cada 2h para exibição
+  $horas_exib = [];
+  for ($h=7; $h<=18; $h+=2) $horas_exib[] = sprintf('%02d:00', $h);
+  // Junta com horários reais
+  $horas_todas = array_unique(array_merge($horas_exib, array_keys($por_hora)));
+  sort($horas_todas);
+
+  foreach ($horas_todas as $hora): ?>
+  <div class="grid border-b border-outline-variant/10 last:border-0" style="grid-template-columns:80px repeat(5,1fr)">
+    <!-- Hora -->
+    <div class="p-2 text-[10px] font-bold text-on-surface-variant text-center pt-3"><?= $hora ?></div>
+    <!-- Dias -->
+    <?php foreach ([1,2,3,4,5] as $d):
+      $slot = $por_hora[$hora][$d] ?? null;
+    ?>
+    <div class="cron-cell">
+      <?php if ($slot):
+        $vagas_ocu = (int)$slot['reservas_ativas'];
+        $vagas_tot = (int)$slot['vagas_total'];
+        $lotado = $vagas_ocu >= $vagas_tot;
+        $tipo = ($vagas_ocu > 0 && !$lotado) ? 'tipo-ciclo' : ($lotado ? 'tipo-plantao' : '');
+        $prac_arr = array_slice(array_filter(array_map('trim',explode(',',$slot['praticas']??''))),0,2);
+      ?>
+      <div class="cron-slot <?= $tipo ?: 'tipo-ciclo' ?>" onclick="abrirModal('modal-editar-slot'); preencherEditSlot(<?= htmlspecialchars(json_encode($slot),ENT_QUOTES) ?>)">
+        <div class="flex items-center justify-between mb-1">
+          <span class="font-bold text-[11px]"><?= substr($slot['hora_inicio'],0,5) ?>–<?= substr($slot['hora_fim'],0,5) ?></span>
+          <span class="text-[9px] font-bold px-1.5 py-0.5 rounded-full <?= $lotado?'bg-red-500/30':'bg-white/25' ?>">
+            <?= $lotado ? 'Lotado' : "{$vagas_ocu}/{$vagas_tot}" ?>
+          </span>
+        </div>
+        <?php foreach ($prac_arr as $pp): ?><span class="text-[9px] opacity-80"><?= htmlspecialchars($pp) ?></span><br><?php endforeach; ?>
+        <?php if (!empty($slot['pac_nomes'])): ?>
+        <div class="mt-1 pt-1 border-t border-white/20">
+          <?php foreach (array_slice($slot['pac_nomes'],0,2) as $pn): ?>
+          <p class="text-[9px] opacity-90 truncate">· <?= htmlspecialchars($pn) ?></p>
+          <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+      </div>
+      <?php else: ?>
+      <div class="cron-slot tipo-livre" onclick="preencherNovoSlot(<?= $d ?>, '<?= $hora ?>'); abrirModal('modal-novo-slot')">
+        <span class="text-[9px]">+ Adicionar</span>
+      </div>
+      <?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <?php endforeach; ?>
+</div>
+
+<!-- Lista de todos os ciclos -->
+<?php
+$todos_ciclos = $pdo->prepare("
+    SELECT c.id AS ciclo_id, c.total_sessoes, c.faltas, c.status AS ciclo_status,
+           r.paciente_id AS pac_uid, r.data_sessao,
+           u.nome AS pnome, u.telefone,
+           s.hora_inicio, s.hora_fim, s.dia_semana, s.praticas,
+           (SELECT COUNT(*) FROM anamnese_inicial WHERE ciclo_id=c.id) AS tem_anamnese,
+           (SELECT COUNT(*) FROM registros_sessao WHERE ciclo_id=c.id AND status='realizado') AS followups_ok
+    FROM ciclos c JOIN reservas r ON c.reserva_id=r.id
+    JOIN usuarios u ON r.paciente_id=u.id JOIN slots s ON r.slot_id=s.id
+    WHERE s.terapeuta_id=? AND c.status IN ('ativo','concluido','cancelado')
+    ORDER BY FIELD(c.status,'ativo','concluido','cancelado'), s.dia_semana, s.hora_inicio
+");
+$todos_ciclos->execute([$uid]); $todos_ciclos = $todos_ciclos->fetchAll(PDO::FETCH_ASSOC);
+foreach ($todos_ciclos as &$tc) {
+    $tc['sessoes_feitas'] = (int)$tc['tem_anamnese']+(int)$tc['followups_ok'];
+    $tc['proxima_sessao'] = $tc['tem_anamnese']==0 ? 1 : ($tc['sessoes_feitas']+1);
+} unset($tc);
+?>
+<div class="glass rounded-2xl p-5 border border-outline-variant/20">
+  <h2 class="font-headline font-bold text-on-surface mb-4">Todos os ciclos (<?= count($todos_ciclos) ?>)</h2>
+  <?php if (empty($todos_ciclos)): ?>
+  <p class="text-sm text-on-surface-variant text-center py-8">Nenhum ciclo ainda. Confirme reservas pendentes para iniciar ciclos.</p>
+  <?php else: ?>
+  <div class="space-y-2.5">
+    <?php foreach ($todos_ciclos as $tc):
+      $prox=(int)$tc['proxima_sessao']; $total=(int)$tc['total_sessoes']; $feitas=(int)$tc['sessoes_feitas'];
+      $ativo=$tc['ciclo_status']==='ativo';
+    ?>
+    <div class="flex flex-col sm:flex-row sm:items-center gap-3 rounded-2xl px-4 py-3.5 border border-outline-variant/20 <?= $ativo?'bg-surface-container-low/60':'opacity-60 bg-white/40' ?>">
+      <div class="flex-grow min-w-0">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="font-bold text-sm text-on-surface"><?= htmlspecialchars($tc['pnome']) ?></span>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full
+            <?= $tc['ciclo_status']==='ativo'?'bg-primary/10 text-primary':($tc['ciclo_status']==='concluido'?'bg-indigo-100 text-indigo-700':'bg-red-50 text-red-600') ?>">
+            <?= ucfirst($tc['ciclo_status']) ?>
+          </span>
+          <?php if ((int)$tc['faltas']>0): ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full <?= $tc['faltas']>=2?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700' ?>"><?= $tc['faltas'] ?> falta<?= $tc['faltas']>1?'s':'' ?></span>
+          <?php endif; ?>
+        </div>
+        <p class="text-xs text-on-surface-variant"><?= $dias_full[(int)$tc['dia_semana']] ?> · <?= substr($tc['hora_inicio'],0,5) ?>–<?= substr($tc['hora_fim'],0,5) ?></p>
+        <div class="flex items-center gap-1 mt-2">
+          <?php for($i=1;$i<=$total;$i++): $d=$i<=$feitas; $c=$ativo&&$i===$prox; ?>
+          <div class="pdot <?= $d?'done':($c?'curr':'idle') ?>" style="width:1.2rem;height:1.2rem;font-size:.55rem"><?= $d?'✓':$i ?></div>
+          <?php if($i<$total): ?><div class="w-2.5 h-0.5 rounded-full <?= $d?'bg-primary':'bg-outline-variant' ?>"></div><?php endif; ?>
+          <?php endfor; ?>
+          <span class="ml-1 text-xs text-on-surface-variant"><?= $feitas ?>/<?= $total ?></span>
+        </div>
+      </div>
+      <?php if ($ativo && $prox<=$total): ?>
+      <a href="sessao.php?ciclo_id=<?= $tc['ciclo_id'] ?>"
+        class="shrink-0 flex items-center justify-center gap-1 px-3 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90">
+        <span class="material-symbols-outlined text-sm">edit_note</span>
+        <?= $prox===1?'Anamnese':("Sessão {$prox}") ?>
+      </a>
+      <?php elseif ($ativo && $feitas>=$total): ?>
+      <a href="relatorio.php?ciclo_id=<?= $tc['ciclo_id'] ?>"
+        class="shrink-0 flex items-center justify-center gap-1 px-3 py-2 rounded-full bg-indigo-600 text-white text-xs font-bold hover:opacity-90">
+        <span class="material-symbols-outlined text-sm">summarize</span>Relatório
+      </a>
+      <?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; ?>
+</div>
+
+<?php elseif ($aba === 'pacientes'): ?>
+
+<div class="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+  <div>
+    <h1 class="text-2xl font-extrabold text-primary">Meus pacientes</h1>
+    <p class="text-sm text-on-surface-variant"><?= count($pacientes_lista) ?> paciente<?= count($pacientes_lista)!=1?'s':'' ?> atendido<?= count($pacientes_lista)!=1?'s':'' ?> por mim</p>
+  </div>
+</div>
+
+<!-- Busca -->
+<div class="relative mb-5 max-w-md">
+  <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-outline text-lg">search</span>
+  <input type="text" id="busca-paciente" placeholder="Buscar por nome ou e-mail..." oninput="filtrarPacientes()"/>
+</div>
+
+<div id="lista-pacientes" class="grid gap-3">
+  <?php foreach ($pacientes_lista as $pac):
+    $bloqueado = $pac['bloqueado_ate'] && $pac['bloqueado_ate'] >= date('Y-m-d');
+    $idade = $pac['data_nasc'] ? floor((time()-strtotime($pac['data_nasc']))/31557600) : null;
+  ?>
+  <div class="pac-item card-h glass rounded-2xl p-5 border border-outline-variant/20 cursor-pointer"
+       data-nome="<?= strtolower($pac['nome']) ?>" data-email="<?= strtolower($pac['email']) ?>"
+       onclick="abrirHistPaciente(<?= $pac['id'] ?>, '<?= addslashes($pac['nome']) ?>')">
+    <div class="flex flex-col sm:flex-row sm:items-center gap-4">
+      <div class="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+        <span class="material-symbols-outlined text-primary">person</span>
+      </div>
+      <div class="flex-grow min-w-0">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <h3 class="font-headline font-bold text-on-surface"><?= htmlspecialchars($pac['nome']) ?></h3>
+          <?php if ($bloqueado): ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-700">Bloqueado até <?= date('d/m',strtotime($pac['bloqueado_ate'])) ?></span>
+          <?php endif; ?>
+          <?php if ($pac['status_ciclo_ativo']): ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-primary/10 text-primary">Ciclo ativo</span>
+          <?php endif; ?>
+          <?php if ($pac['vinculo']): ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full <?= $pac['vinculo']==='interno'?'bg-blue-50 text-blue-700':'bg-amber-50 text-amber-700' ?>"><?= $pac['vinculo']==='interno'?'🎓 Interno':'🏙️ Externo' ?></span>
+          <?php endif; ?>
+        </div>
+        <div class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-on-surface-variant">
+          <span><?= htmlspecialchars($pac['email']) ?></span>
+          <?php if ($pac['telefone']): ?><span><?= htmlspecialchars($pac['telefone']) ?></span><?php endif; ?>
+          <?php if ($idade): ?><span><?= $idade ?> anos</span><?php endif; ?>
+          <?php if ($pac['sexo']): ?><span><?= htmlspecialchars($pac['sexo']) ?></span><?php endif; ?>
+        </div>
+        <?php if ($pac['objetivos']): ?>
+        <p class="text-xs text-on-surface-variant mt-1">Objetivos: <?= htmlspecialchars(mb_substr($pac['objetivos'],0,80)) ?></p>
+        <?php endif; ?>
+      </div>
+      <div class="flex items-center gap-3 shrink-0">
+        <div class="text-center">
+          <p class="text-xl font-extrabold text-primary"><?= (int)$pac['meus_ciclos'] ?></p>
+          <p class="text-[10px] text-on-surface-variant">ciclos comigo</p>
+        </div>
+        <span class="material-symbols-outlined text-outline-variant">chevron_right</span>
+      </div>
+    </div>
+  </div>
+  <?php endforeach; ?>
+  <?php if (empty($pacientes_lista)): ?>
+  <div class="text-center py-14 text-on-surface-variant">
+    <span class="material-symbols-outlined text-5xl mb-3 block">group</span>
+    <p class="text-sm">Nenhum paciente atendido ainda.</p>
+  </div>
+  <?php endif; ?>
+</div>
+
+<?php elseif ($aba === 'terapeutas'): ?>
+
+<div class="mb-6">
+  <h1 class="text-2xl font-extrabold text-primary mb-1">Equipe NUPICS</h1>
+  <p class="text-sm text-on-surface-variant"><?= count($terapeutas_lista) ?> terapeuta<?= count($terapeutas_lista)!=1?'s':'' ?> cadastrado<?= count($terapeutas_lista)!=1?'s':'' ?></p>
+</div>
+<div class="relative mb-5 max-w-md">
+  <span class="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-outline text-lg">search</span>
+  <input type="text" id="busca-terapeuta" placeholder="Buscar terapeuta..." oninput="filtrarTerapeutas()"/>
+</div>
+<div id="lista-terapeutas" class="grid sm:grid-cols-2 gap-4">
+  <?php foreach ($terapeutas_lista as $ter): ?>
+  <div class="ter-item card-h glass rounded-2xl p-5 border border-outline-variant/20"
+       data-nome="<?= strtolower($ter['nome']) ?>" data-email="<?= strtolower($ter['email']) ?>">
+    <div class="flex items-start gap-4">
+      <div class="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+        <span class="material-symbols-outlined text-primary">person</span>
+      </div>
+      <div class="flex-grow min-w-0">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <h3 class="font-headline font-bold text-on-surface"><?= htmlspecialchars($ter['nome']) ?></h3>
+          <?php if ($ter['id']==$uid): ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-primary/10 text-primary">Você</span>
+          <?php endif; ?>
+          <span class="text-[10px] font-bold px-2 py-0.5 rounded-full <?= $ter['ativo']?'bg-emerald-100 text-emerald-700':'bg-red-50 text-red-500' ?>"><?= $ter['ativo']?'Ativo':'Inativo' ?></span>
+        </div>
+        <p class="text-xs text-on-surface-variant"><?= htmlspecialchars($ter['especialidade']) ?> · <?= htmlspecialchars($ter['periodo']) ?></p>
+        <?php if ($ter['email']): ?><p class="text-xs text-on-surface-variant mt-0.5"><?= htmlspecialchars($ter['email']) ?></p><?php endif; ?>
+        <?php if ($ter['telefone']): ?><p class="text-xs text-on-surface-variant"><?= htmlspecialchars($ter['telefone']) ?></p><?php endif; ?>
+        <div class="flex gap-4 mt-2.5">
+          <div class="text-center"><p class="text-lg font-extrabold text-primary"><?= (int)$ter['ciclos_ativos'] ?></p><p class="text-[10px] text-on-surface-variant">ciclos ativos</p></div>
+          <div class="text-center"><p class="text-lg font-extrabold text-indigo-700"><?= (int)$ter['ciclos_concluidos'] ?></p><p class="text-[10px] text-on-surface-variant">concluídos</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <?php endforeach; ?>
+</div>
+
+<?php elseif ($aba === 'protocolos'): ?>
+<div class="flex flex-col items-center justify-center py-24 text-center">
+  <span class="material-symbols-outlined text-6xl text-outline-variant mb-5">construction</span>
+  <h1 class="text-2xl font-extrabold text-primary mb-3">Protocolos</h1>
+  <p class="text-on-surface-variant max-w-sm leading-relaxed">Esta seção está em construção. Em breve, você poderá acessar e gerenciar os protocolos de atendimento do NUPICS aqui.</p>
+  <div class="mt-6 px-5 py-2 rounded-full bg-primary/10 text-primary text-sm font-bold">Em breve 🚧</div>
+</div>
+
+<?php elseif ($aba === 'perfil'):
+    $perfil = $pdo->prepare("SELECT u.*, t.especialidade, t.periodo FROM usuarios u LEFT JOIN terapeutas t ON t.usuario_id=u.id WHERE u.id=?");
+    $perfil->execute([$uid]); $perfil = $perfil->fetch(PDO::FETCH_ASSOC);
+?>
+<div class="max-w-2xl mx-auto">
+  <h1 class="text-2xl font-extrabold text-primary mb-6">Meu perfil</h1>
+  <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-5">
+    <!-- Avatar -->
+    <div class="flex items-center gap-5">
+      <div class="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center">
+        <span class="material-symbols-outlined text-primary text-4xl">person</span>
+      </div>
+      <div>
+        <h2 class="text-xl font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2>
+        <p class="text-sm text-on-surface-variant"><?= htmlspecialchars($perfil['especialidade']??'Terapeuta') ?> · <?= htmlspecialchars($perfil['periodo']??'') ?></p>
+      </div>
+    </div>
+    <!-- Campos -->
+    <?php foreach ([
+      ['E-mail','mail',$perfil['email']],
+      ['Telefone','phone',$perfil['telefone']??'Não informado'],
+      ['Especialidade','self_care',$perfil['especialidade']??'—'],
+      ['Período / vínculo','badge',$perfil['periodo']??'—'],
+      ['Membro desde','calendar_today',date('d/m/Y',strtotime($perfil['criado_em']))],
+    ] as [$l,$ic,$v]): ?>
+    <div class="flex items-center gap-4 bg-surface-container-low/60 rounded-2xl px-5 py-4 border border-outline-variant/15">
+      <span class="material-symbols-outlined text-secondary text-lg shrink-0"><?= $ic ?></span>
+      <div><p class="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant"><?= $l ?></p>
+      <p class="font-bold text-sm text-on-surface mt-0.5"><?= htmlspecialchars($v) ?></p></div>
+    </div>
+    <?php endforeach; ?>
+    <div class="pt-2">
+      <a href="?aba=painel" class="block w-full text-center py-3.5 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white font-bold text-sm hover:opacity-90 transition-all">Voltar ao painel</a>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
 
 </main>
 
-<!-- FAB -->
-<button onclick="document.getElementById('modal-plantao').classList.add('open')"
-        class="fixed bottom-7 right-7 w-13 h-13 grad rounded-full shadow-2xl flex items-center justify-center text-white hover:scale-110 transition-transform z-40 w-14 h-14">
-  <span class="material-symbols-outlined text-2xl">add</span>
-</button>
+<!-- ═══════════════════════════════════════════
+     MODAIS (presentes em todas as abas)
+═══════════════════════════════════════════ -->
 
-<!-- MODAL: Plantão -->
-<div class="modal-bg" id="modal-plantao">
-  <div class="bg-white rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden">
-    <div class="flex justify-between items-center px-6 pt-5 pb-4 border-b border-gray-100">
-      <h3 class="text-base font-extrabold headline text-gray-800">Registrar Sessão de Plantão</h3>
-      <button onclick="document.getElementById('modal-plantao').classList.remove('open')" class="w-8 h-8 rounded-full bg-gray-100 hover:bg-gray-200 flex items-center justify-center text-gray-500">✕</button>
+<!-- Modal: Novo slot -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-novo-slot">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-novo-slot')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 class="text-lg font-extrabold text-primary">Novo horário de atendimento</h2>
+      <button onclick="fecharModal('modal-novo-slot')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
     </div>
-    <form method="POST" class="px-6 py-5 space-y-3">
-      <input type="hidden" name="acao" value="registrar_plantao">
-      <input type="hidden" name="paciente_id" id="pac-id-hidden" value="">
+    <form id="form-novo-slot" class="overflow-y-auto px-6 pb-6 flex-1 space-y-4" onsubmit="salvarSlot(event)">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Dia da semana</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span>
+            <select name="dia_semana" id="novo-slot-dia" required>
+              <option value="">Selecione</option>
+              <?php foreach ($dias_full as $n=>$d): ?><option value="<?= $n ?>"><?= $d ?></option><?php endforeach; ?>
+            </select></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Vagas</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">group</span></span>
+            <input type="number" name="vagas_total" min="1" max="10" value="2"/></div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora início</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span>
+            <input type="time" name="hora_inicio" id="novo-slot-hi" required/></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora fim</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span>
+            <input type="time" name="hora_fim" id="novo-slot-hf" required/></div>
+        </div>
+      </div>
       <div>
-        <label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Terapeuta *</label>
-        <select name="terapeuta_id" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-          <option value="">Selecione</option>
-          <?php foreach($terapeutas as $t): if(!$t['ativo']) continue; ?><option value="<?= $t['id'] ?>"><?= htmlspecialchars($t['nome']) ?></option><?php endforeach; ?>
-        </select>
-      </div>
-      <div class="relative">
-        <label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Nome do paciente * <span class="normal-case font-normal text-gray-400">(busca cadastrados)</span></label>
-        <input type="text" name="paciente_nome" id="pac-nome-input" placeholder="Digite o nome..." required autocomplete="off" oninput="buscarPacientesModal(this.value)" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-        <div id="pac-sugestoes" class="absolute top-full left-0 right-0 bg-white border border-gray-100 rounded-xl shadow-lg mt-1 hidden z-10 max-h-40 overflow-y-auto"></div>
-        <div id="pac-vinculado" class="hidden mt-1 px-3 py-1.5 bg-green-50 border border-green-200 rounded-xl text-xs text-green-700 font-medium"></div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Local / sala</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span>
+          <input type="text" name="local" placeholder="Ex: Sala 04 – Bloco A"/></div>
       </div>
       <div>
-        <label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Prática *</label>
-        <select name="tipo_pratica" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"><option value="">Selecione</option><?php foreach(['Massoterapia','Ventosaterapia','Acupuntura','Reiki','Aromaterapia','Auriculoterapia','Escalda-pés','Reflexologia','Meditação','Outra'] as $pr): ?><option value="<?= $pr ?>"><?= $pr ?></option><?php endforeach; ?></select>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-2">Práticas oferecidas</label>
+        <div class="flex flex-wrap gap-2">
+          <?php foreach ($praticas_opcoes as $po): ?>
+          <label class="pill-opt"><input type="checkbox" class="novo-slot-prat" value="<?= $po ?>"><?= $po ?></label>
+          <?php endforeach; ?>
+        </div>
       </div>
-      <div class="grid grid-cols-3 gap-2">
-        <div><label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Data</label><input type="date" name="data_sessao" value="<?= date('Y-m-d') ?>" class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"></div>
-        <div><label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Hora</label><input type="time" name="hora_sessao" value="<?= date('H:i') ?>" class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"></div>
-        <div><label class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-1 block">Status</label><select name="status_sessao" class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-purple-400"><option value="realizado">Realizado</option><option value="faltou">Faltou</option><option value="cancelado">Cancelado</option></select></div>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm font-medium cursor-pointer">
+          <span class="tog"><input type="checkbox" name="aceita_interno" checked></span>🎓 Interno
+        </label>
+        <label class="flex items-center gap-2 text-sm font-medium cursor-pointer">
+          <span class="tog"><input type="checkbox" name="aceita_externo" checked></span>🏙️ Externo
+        </label>
       </div>
-      <textarea name="observacao" rows="2" placeholder="Observações clínicas..." class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400 resize-none"></textarea>
-      <button type="submit" class="w-full py-3 grad text-white font-bold text-sm rounded-xl hover:opacity-90">Registrar sessão</button>
+      <div id="slot-erro" class="hidden text-xs text-error font-medium flex items-center gap-1">
+        <span class="material-symbols-outlined text-sm">error</span><span></span>
+      </div>
+      <button type="submit" class="w-full py-3.5 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">save</span>Criar horário
+      </button>
     </form>
   </div>
 </div>
 
-<!-- MODAL: Aviso -->
-<div class="modal-bg" id="modal-aviso">
-  <div class="bg-white rounded-3xl w-full max-w-sm shadow-2xl overflow-hidden">
-    <div class="flex justify-between items-center px-6 pt-5 pb-4 border-b border-gray-100">
-      <h3 class="text-base font-extrabold headline text-gray-800">Novo Aviso</h3>
-      <button onclick="document.getElementById('modal-aviso').classList.remove('open')" class="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center text-gray-500">✕</button>
+<!-- Modal: Editar slot -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-editar-slot">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-editar-slot')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-7">
+    <h2 class="text-lg font-extrabold text-primary mb-5">Editar horário</h2>
+    <input type="hidden" id="edit-slot-id"/>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Vagas</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">group</span></span>
+            <input type="number" id="edit-vagas" min="1" max="10"/></div></div>
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Status</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">toggle_on</span></span>
+            <select id="edit-ativo"><option value="1">Ativo</option><option value="0">Inativo</option></select></div></div>
+      </div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Local</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span>
+          <input type="text" id="edit-local"/></div></div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-2">Práticas</label>
+        <div class="flex flex-wrap gap-2" id="edit-prat-wrap">
+          <?php foreach ($praticas_opcoes as $po): ?>
+          <label class="pill-opt"><input type="checkbox" class="edit-prat-cb" value="<?= $po ?>"><?= $po ?></label>
+          <?php endforeach; ?>
+        </div>
+      </div>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><span class="tog"><input type="checkbox" id="edit-interno" checked></span>Interno</label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><span class="tog"><input type="checkbox" id="edit-externo" checked></span>Externo</label>
+      </div>
+      <div class="flex gap-3 pt-1">
+        <button onclick="salvarEdicaoSlot()" class="flex-grow py-3.5 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90 transition-all">Salvar</button>
+        <button onclick="excluirSlot()" class="px-5 py-3.5 rounded-full border-2 border-red-200 text-red-600 font-bold text-sm hover:bg-red-50 transition-all">Excluir</button>
+        <button onclick="fecharModal('modal-editar-slot')" class="px-5 py-3.5 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm hover:bg-surface-container-high transition-all">Cancelar</button>
+      </div>
     </div>
-    <form method="POST" class="px-6 py-5 space-y-3">
-      <input type="hidden" name="acao" value="add_aviso">
-      <select name="tipo_aviso" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400"><?php foreach($tipos_aviso as $v=>$l): ?><option value="<?= $v ?>"><?= $l ?></option><?php endforeach; ?></select>
-      <input type="text" name="titulo_aviso" placeholder="Título" required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400">
-      <textarea name="texto_aviso" rows="3" placeholder="Texto do aviso..." required class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-purple-400 resize-none"></textarea>
-      <button type="submit" class="w-full py-2.5 grad text-white text-sm font-bold rounded-xl hover:opacity-90">Publicar</button>
-    </form>
+  </div>
+</div>
+
+<!-- Modal: Novo plantão -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-plantao-novo">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-plantao-novo')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-7">
+    <h2 class="text-lg font-extrabold text-primary mb-5">Iniciar plantão</h2>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora início</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span>
+            <input type="time" id="plt-hi" value="<?= date('H:i') ?>"/></div></div>
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora fim</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span>
+            <input type="time" id="plt-hf" value="<?= date('H:i', strtotime('+2 hours')) ?>"/></div></div>
+      </div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Local</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span>
+          <input type="text" id="plt-local" placeholder="Ex: Sala de espera – Bloco A"/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Máx. de pacientes</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">group</span></span>
+          <input type="number" id="plt-max" min="1" max="20" value="4"/></div></div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-2">Práticas do plantão</label>
+        <div class="flex flex-wrap gap-2">
+          <?php foreach ($praticas_opcoes as $po): ?>
+          <label class="pill-opt"><input type="checkbox" class="plt-prat-check" value="<?= $po ?>"><?= $po ?></label>
+          <?php endforeach; ?>
+        </div>
+      </div>
+      <button onclick="abrirPlantao()" class="w-full py-3.5 rounded-full bg-emerald-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">local_hospital</span>Abrir plantão
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Registrar atendimento no plantão -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-plantao-ativo">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-plantao-ativo')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <div>
+        <h2 class="text-lg font-extrabold text-primary">Registrar atendimento</h2>
+        <p class="text-xs text-on-surface-variant" id="plt-ativo-sub">
+          <?php if ($plantao_aberto): ?>Plantão · <?= (int)$plantao_aberto['total_atendidos'] ?>/<?= (int)$plantao_aberto['max_pacientes'] ?> atendidos<?php endif; ?>
+        </p>
+      </div>
+      <button onclick="fecharModal('modal-plantao-ativo')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-4">
+      <?php if (!$plantao_aberto): ?>
+      <div class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800 font-medium flex items-center gap-2">
+        <span class="material-symbols-outlined text-amber-500">warning</span>
+        Nenhum plantão aberto. <a href="#" onclick="fecharModal('modal-plantao-ativo');abrirModal('modal-plantao-novo')" class="underline font-bold">Iniciar plantão primeiro</a>
+      </div>
+      <?php else: ?>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Nome do paciente <span class="text-secondary font-normal normal-case tracking-normal">(obrigatório)</span></label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">person</span></span>
+            <input type="text" id="sp-nome" placeholder="Nome completo"/></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">E-mail (se cadastrado)</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">mail</span></span>
+            <input type="email" id="sp-email" placeholder="Para vincular ao histórico"/></div>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-2">Prática(s) realizada(s) <span class="text-secondary font-normal normal-case tracking-normal">(obrigatório — marque quantas quiser)</span></label>
+        <div class="flex flex-wrap gap-2">
+          <?php foreach ($praticas_opcoes as $po): ?>
+          <label class="pill-opt"><input type="checkbox" class="sp-prat-check" value="<?= $po ?>"><?= $po ?></label>
+          <?php endforeach; ?>
+        </div>
+        <div id="sp-prat-erro" class="hidden text-xs text-error font-medium mt-1 flex items-center gap-1">
+          <span class="material-symbols-outlined text-sm">error</span>Selecione ao menos uma prática.
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Queixa principal</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">help</span></span>
+          <textarea id="sp-queixa" rows="2" placeholder="Motivo do atendimento..."></textarea></div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Dor (0–10)</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">monitor_heart</span></span>
+            <input type="number" id="sp-dor" min="0" max="10" placeholder="0–10"/></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Localização</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span>
+            <input type="text" id="sp-dor-loc" placeholder="Ex: lombar"/></div>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Alergias / medicamentos</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">medication</span></span>
+          <input type="text" id="sp-alergias" placeholder="Alergias ou medicamentos em uso?"/></div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Orientações dadas</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">assignment</span></span>
+          <textarea id="sp-orient" rows="2" placeholder="O que foi orientado?"></textarea></div>
+      </div>
+      <div id="sp-erro" class="hidden text-xs text-error font-medium flex items-center gap-1">
+        <span class="material-symbols-outlined text-sm">error</span><span id="sp-erro-msg"></span>
+      </div>
+      <button onclick="registrarAtendimento()" class="w-full py-3.5 rounded-full bg-emerald-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">check_circle</span>Registrar atendimento
+      </button>
+      <?php endif; ?>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Adiar -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-adiar">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-adiar')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-8">
+    <h2 class="text-xl font-extrabold text-primary mb-1">Adiar sessão</h2>
+    <p id="adiar-sub" class="text-sm text-on-surface-variant mb-5"></p>
+    <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Motivo <span class="text-secondary font-normal normal-case">(visível ao paciente e coordenação)</span></label>
+    <textarea id="adiar-motivo" rows="3" placeholder="Ex: Terapeuta ficará ausente. Entraremos em contato para reagendar."
+      class="w-full rounded-2xl border border-outline-variant/30 bg-white/60 px-4 py-3 text-sm resize-none transition-all mb-5 focus:ring-2 focus:ring-primary focus:border-primary"></textarea>
+    <div class="flex gap-3">
+      <button id="btn-adiar-ok" onclick="confirmarAdiar()"
+        class="flex-grow py-4 rounded-full bg-amber-500 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">event_busy</span>Confirmar adiamento
+      </button>
+      <button onclick="fecharModal('modal-adiar')" class="px-6 py-4 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm hover:bg-surface-container-high transition-all">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Faltou -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-faltou">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-faltou')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-8">
+    <div id="falta-aviso-2" class="hidden mb-4 bg-red-50 border border-red-200 rounded-xl px-4 py-3 flex items-start gap-3">
+      <span class="material-symbols-outlined text-red-500 shrink-0">warning</span>
+      <div><p class="font-bold text-red-800 text-sm">Segunda falta — paciente bloqueado por 30 dias</p>
+      <p class="text-red-700 text-sm mt-0.5">Regra automática do sistema. O paciente receberá notificação explicando a política do NUPICS.</p></div>
+    </div>
+    <h2 class="text-xl font-extrabold text-primary mb-1">Registrar falta</h2>
+    <p id="faltou-sub" class="text-sm text-on-surface-variant mb-5"></p>
+    <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Justificativa (se houver)</label>
+    <textarea id="faltou-just" rows="2" placeholder="Informe caso o paciente tenha justificado..."
+      class="w-full rounded-2xl border border-outline-variant/30 bg-white/60 px-4 py-3 text-sm resize-none transition-all mb-5 focus:ring-2 focus:ring-primary focus:border-primary"></textarea>
+    <div class="flex gap-3">
+      <button id="btn-faltou-ok" onclick="confirmarFaltou()"
+        class="flex-grow py-4 rounded-full bg-red-500 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">person_off</span>Confirmar falta
+      </button>
+      <button onclick="fecharModal('modal-faltou')" class="px-6 py-4 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm hover:bg-surface-container-high transition-all">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Histórico do paciente -->
+<div class="modal-wrap fixed inset-0 z-[101] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-hist-pac">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-hist-pac')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-xl rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 id="hist-pac-titulo" class="text-lg font-extrabold text-primary">Histórico do paciente</h2>
+      <button onclick="fecharModal('modal-hist-pac')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div id="hist-pac-body" class="overflow-y-auto px-6 pb-6 flex-1 space-y-3">
+      <div class="text-center py-8 text-on-surface-variant text-sm">Carregando...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Playlist -->
+<div class="modal-wrap fixed inset-0 z-[101] items-center justify-center p-4" id="modal-playlist">
+  <div class="absolute inset-0 bg-primary/25 backdrop-blur-sm" onclick="fecharModalPlaylist()"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-2xl rounded-[2rem] shadow-2xl overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-5 pb-3">
+      <h2 id="playlist-titulo" class="text-base font-extrabold text-primary"></h2>
+      <button onclick="fecharModalPlaylist()" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div class="aspect-video"><iframe id="playlist-frame" width="100%" height="100%" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen class="w-full h-full"></iframe></div>
+    <p class="px-6 py-3 text-xs text-on-surface-variant">Feche para pausar.</p>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] hidden pointer-events-none">
+  <div class="glass rounded-full px-5 py-3 flex items-center gap-2 shadow-xl">
+    <span id="toast-icon" class="material-symbols-outlined text-base"></span>
+    <span id="toast-msg" class="text-sm font-semibold text-on-surface"></span>
   </div>
 </div>
 
 <script>
-var allAbas = ['home','agenda','ciclos','pacientes_tab','equipe','gestao','conteudo'];
-function setAba(id) {
-  allAbas.forEach(function(a){var el=document.getElementById('aba-'+a);if(el)el.style.display=a===id?'block':'none';});
-  document.querySelectorAll('.nav-tab').forEach(function(btn){
-    btn.classList.remove('on');
-    if(btn.getAttribute('onclick')&&btn.getAttribute('onclick').includes("'"+id+"'"))btn.classList.add('on');
+const PLANTAO_ID = <?= $plantao_aberto ? (int)$plantao_aberto['id'] : 'null' ?>;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function abrirModal(id)  { document.getElementById(id).classList.add('open'); document.body.style.overflow='hidden'; }
+function fecharModal(id) { document.getElementById(id).classList.remove('open'); document.body.style.overflow=''; }
+function fecharModalPlaylist() { document.getElementById('playlist-frame').src=''; fecharModal('modal-playlist'); }
+function toast(msg, icon='check_circle', cor='text-emerald-600') {
+  const t=document.getElementById('toast');
+  document.getElementById('toast-msg').textContent=msg;
+  const ic=document.getElementById('toast-icon'); ic.textContent=icon; ic.className='material-symbols-outlined text-base '+cor;
+  t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),3500);
+}
+async function api(url, dados) {
+  const f=new FormData(); Object.entries(dados).forEach(([k,v])=>{ if(v!=null) f.append(k,v); });
+  const r=await fetch(url,{method:'POST',body:f}); return r.json();
+}
+
+// ── Playlist ──────────────────────────────────────────────────────────────────
+function abrirPlaylist(ytId, nome) {
+  document.getElementById('playlist-titulo').textContent=nome;
+  document.getElementById('playlist-frame').src=`https://www.youtube.com/embed/${ytId}?autoplay=1`;
+  abrirModal('modal-playlist');
+}
+
+// ── Cronograma: preenche novo slot com dia/hora do clique na grade ─────────────
+function preencherNovoSlot(dia, hora) {
+  const sel = document.getElementById('novo-slot-dia');
+  if (sel) sel.value = dia;
+  const hi = document.getElementById('novo-slot-hi');
+  if (hi) hi.value = hora;
+}
+function preencherEditSlot(slot) { abrirEditarSlot(slot); }
+function abrirEditarSlot(slot) {
+  document.getElementById('edit-slot-id').value = slot.id;
+  document.getElementById('edit-vagas').value   = slot.vagas_total;
+  document.getElementById('edit-ativo').value   = slot.ativo;
+  document.getElementById('edit-local').value   = slot.local||'';
+  // Práticas checkboxes
+  const prats = (slot.praticas||'').split(',').map(s=>s.trim());
+  document.querySelectorAll('.edit-prat-cb').forEach(cb => { cb.checked = prats.includes(cb.value); });
+  document.getElementById('edit-interno').checked = !!+slot.aceita_interno;
+  document.getElementById('edit-externo').checked = !!+slot.aceita_externo;
+}
+async function salvarSlot(e) {
+  e.preventDefault();
+  const form = document.getElementById('form-novo-slot');
+  const fd = new FormData(form);
+  const prats = [...document.querySelectorAll('.novo-slot-prat:checked')].map(c=>c.value);
+  fd.set('praticas', prats.join(', '));
+  fd.set('acao', 'criar_slot');
+  const r = await fetch('../api/agenda_action.php',{method:'POST',body:fd});
+  const res = await r.json();
+  if (res.ok) { toast('Horário criado!','schedule','text-emerald-600'); fecharModal('modal-novo-slot'); setTimeout(()=>location.reload(),900); }
+  else { const e=document.getElementById('slot-erro'); e.classList.remove('hidden'); e.querySelector('span:last-child').textContent=res.msg; }
+}
+async function salvarEdicaoSlot() {
+  const prats = [...document.querySelectorAll('.edit-prat-cb:checked')].map(c=>c.value);
+  const dados = {
+    acao:'editar_slot', slot_id:document.getElementById('edit-slot-id').value,
+    vagas_total:document.getElementById('edit-vagas').value,
+    ativo:document.getElementById('edit-ativo').value,
+    local:document.getElementById('edit-local').value,
+    praticas:prats.join(', '),
+  };
+  if (document.getElementById('edit-interno').checked) dados.aceita_interno='1';
+  if (document.getElementById('edit-externo').checked) dados.aceita_externo='1';
+  const res = await api('../api/agenda_action.php', dados);
+  if (res.ok) { toast('Atualizado!','check_circle','text-emerald-600'); fecharModal('modal-editar-slot'); setTimeout(()=>location.reload(),900); }
+  else toast(res.msg||'Erro.','error','text-red-500');
+}
+async function excluirSlot() {
+  const sid = document.getElementById('edit-slot-id').value;
+  if (!confirm('Remover este horário?')) return;
+  const res = await api('../api/agenda_action.php', {acao:'excluir_slot', slot_id:sid});
+  if (res.ok) { toast('Removido.','delete','text-red-500'); fecharModal('modal-editar-slot'); setTimeout(()=>location.reload(),900); }
+  else toast(res.msg||'Erro.','error','text-red-500');
+}
+
+// ── Plantão ───────────────────────────────────────────────────────────────────
+async function abrirPlantao() {
+  const prats = [...document.querySelectorAll('.plt-prat-check:checked')].map(c=>c.value).join(', ');
+  const res = await api('../api/agenda_action.php', {
+    acao:'abrir_plantao',
+    hora_inicio:   document.getElementById('plt-hi').value,
+    hora_fim:      document.getElementById('plt-hf').value,
+    local:         document.getElementById('plt-local').value,
+    max_pacientes: document.getElementById('plt-max').value,
+    praticas:      prats,
+  });
+  if (res.ok) { toast('Plantão aberto!','local_hospital','text-emerald-600'); fecharModal('modal-plantao-novo'); setTimeout(()=>location.reload(),1000); }
+  else toast(res.msg||'Erro.','error','text-red-500');
+}
+
+async function registrarAtendimento() {
+  const nome = document.getElementById('sp-nome').value.trim();
+  const prats = [...document.querySelectorAll('.sp-prat-check:checked')].map(c=>c.value);
+  document.getElementById('sp-erro').classList.add('hidden');
+  document.getElementById('sp-prat-erro').classList.add('hidden');
+
+  if (!nome) { document.getElementById('sp-erro-msg').textContent='Informe o nome do paciente.'; document.getElementById('sp-erro').classList.remove('hidden'); return; }
+  if (!prats.length) { document.getElementById('sp-prat-erro').classList.remove('hidden'); return; }
+  if (!PLANTAO_ID) { document.getElementById('sp-erro-msg').textContent='Nenhum plantão aberto. Inicie um plantão primeiro.'; document.getElementById('sp-erro').classList.remove('hidden'); return; }
+
+  const form = new FormData();
+  form.append('acao',           'registrar_plantao');
+  form.append('plantao_id',     PLANTAO_ID);
+  form.append('paciente_nome',  nome);
+  form.append('email_paciente', document.getElementById('sp-email').value);
+  form.append('tipo_pratica',   prats.join(', '));
+  form.append('queixa',         document.getElementById('sp-queixa').value);
+  form.append('dor_intensidade',document.getElementById('sp-dor').value);
+  form.append('dor_localizacao',document.getElementById('sp-dor-loc').value);
+  form.append('alergias_medicamentos', document.getElementById('sp-alergias').value);
+  form.append('orientacoes',    document.getElementById('sp-orient').value);
+
+  try {
+    const r = await fetch('../api/agenda_action.php',{method:'POST',body:form});
+    const res = await r.json();
+    if (res.ok) {
+      toast(`Atendimento registrado!`,'check_circle','text-emerald-600');
+      ['sp-nome','sp-email','sp-queixa','sp-dor','sp-dor-loc','sp-alergias','sp-orient'].forEach(id=>{
+        const el=document.getElementById(id); if(el) el.value='';
+      });
+      document.querySelectorAll('.sp-prat-check').forEach(c=>c.checked=false);
+      setTimeout(()=>location.reload(),1500);
+    } else {
+      document.getElementById('sp-erro-msg').textContent=res.msg||'Erro ao registrar.';
+      document.getElementById('sp-erro').classList.remove('hidden');
+    }
+  } catch {
+    document.getElementById('sp-erro-msg').textContent='Erro de conexão. Verifique o servidor.';
+    document.getElementById('sp-erro').classList.remove('hidden');
+  }
+}
+
+async function encerrarPlantao(pid) {
+  if (!confirm('Encerrar o plantão de hoje?')) return;
+  const res = await api('../api/agenda_action.php', {acao:'encerrar_plantao', plantao_id:pid});
+  if (res.ok) { toast('Plantão encerrado.','stop_circle','text-indigo-600'); setTimeout(()=>location.reload(),900); }
+  else toast(res.msg||'Erro.','error','text-red-500');
+}
+
+// ── Reservas ──────────────────────────────────────────────────────────────────
+async function confirmarRes(rid, btn) {
+  btn.disabled=true; btn.textContent='...';
+  const f=new FormData(); f.append('acao','confirmar_reserva'); f.append('reserva_id',rid);
+  const d=await fetch('../api/ciclo_action.php',{method:'POST',body:f}).then(r=>r.json());
+  if (d.ok) { toast('Confirmado! Ciclo criado.','check_circle','text-emerald-600'); setTimeout(()=>location.reload(),1000); }
+  else { toast(d.msg||'Erro.','error','text-red-500'); btn.disabled=false; btn.textContent='Confirmar'; }
+}
+async function recusarRes(rid, btn) {
+  btn.disabled=true; btn.textContent='...';
+  const f=new FormData(); f.append('acao','cancelar'); f.append('reserva_id',rid);
+  const d=await fetch('../api/reserva_action.php',{method:'POST',body:f}).then(r=>r.json());
+  if (d.ok) { toast('Recusado.','cancel','text-red-500'); setTimeout(()=>location.reload(),1000); }
+  else { toast(d.msg||'Erro.','error','text-red-500'); btn.disabled=false; btn.textContent='Recusar'; }
+}
+
+// ── Ciclos ────────────────────────────────────────────────────────────────────
+let _adiarCiclo=null, _adiarSessao=null;
+function abrirAdiar(cid, snum, pnome) {
+  _adiarCiclo=cid; _adiarSessao=snum;
+  document.getElementById('adiar-sub').textContent=`Paciente: ${pnome} · Sessão ${snum}`;
+  document.getElementById('adiar-motivo').value='';
+  abrirModal('modal-adiar');
+}
+async function confirmarAdiar() {
+  const motivo=document.getElementById('adiar-motivo').value.trim();
+  if (!motivo) { toast('Informe o motivo.','error','text-red-500'); return; }
+  document.getElementById('btn-adiar-ok').disabled=true;
+  const f=new FormData(); f.append('acao','adiar'); f.append('ciclo_id',_adiarCiclo); f.append('sessao_num',_adiarSessao); f.append('motivo',motivo);
+  const d=await fetch('../api/ciclo_action.php',{method:'POST',body:f}).then(r=>r.json());
+  fecharModal('modal-adiar');
+  if (d.ok) { toast('Adiamento notificado.','event_busy','text-amber-600'); setTimeout(()=>location.reload(),1200); }
+  else toast(d.msg||'Erro.','error','text-red-500');
+  document.getElementById('btn-adiar-ok').disabled=false;
+}
+
+let _faltaCiclo=null, _faltaSessao=null;
+function abrirFaltou(cid, snum, faltas, pnome) {
+  _faltaCiclo=cid; _faltaSessao=snum;
+  document.getElementById('faltou-sub').textContent=`Paciente: ${pnome} · Sessão ${snum} · Faltas: ${faltas}`;
+  document.getElementById('faltou-just').value='';
+  document.getElementById('falta-aviso-2').classList.toggle('hidden', faltas<1);
+  abrirModal('modal-faltou');
+}
+async function confirmarFaltou() {
+  const just=document.getElementById('faltou-just').value.trim();
+  document.getElementById('btn-faltou-ok').disabled=true;
+  const f=new FormData(); f.append('acao','faltou'); f.append('ciclo_id',_faltaCiclo); f.append('sessao_num',_faltaSessao); f.append('justificativa',just);
+  const d=await fetch('../api/ciclo_action.php',{method:'POST',body:f}).then(r=>r.json());
+  fecharModal('modal-faltou');
+  if (d.ok) {
+    if (d.acao==='bloqueado') toast('2ª falta! Paciente bloqueado 30 dias.','block','text-red-600');
+    else toast(`Falta ${d.faltas} registrada.`,'person_off','text-amber-600');
+    setTimeout(()=>location.reload(),1200);
+  } else toast(d.msg||'Erro.','error','text-red-500');
+  document.getElementById('btn-faltou-ok').disabled=false;
+}
+
+// ── Busca pacientes / terapeutas ──────────────────────────────────────────────
+function filtrarPacientes() {
+  const q = document.getElementById('busca-paciente').value.toLowerCase();
+  document.querySelectorAll('.pac-item').forEach(el => {
+    const match = el.dataset.nome.includes(q) || el.dataset.email.includes(q);
+    el.classList.toggle('hidden', !match);
   });
 }
-function toggleCadCampos(){var t=document.getElementById('tipo-sel').value;document.getElementById('cad-ter').style.display=t==='terapeuta'?'block':'none';document.getElementById('cad-pac').style.display=t==='paciente'?'block':'none';}
-['modal-plantao','modal-aviso'].forEach(function(id){document.getElementById(id).addEventListener('click',function(e){if(e.target===this)this.classList.remove('open');});});
-
-var pacs_json = <?= json_encode(array_map(function($p){return['id'=>$p['id'],'nome'=>$p['nome']];}, $pacientes)) ?>;
-function buscarPacientesModal(q){
-  var sug=document.getElementById('pac-sugestoes'),vinc=document.getElementById('pac-vinculado');
-  document.getElementById('pac-id-hidden').value='';vinc.classList.add('hidden');
-  if(!q||q.length<2){sug.classList.add('hidden');return;}
-  var m=pacs_json.filter(function(p){return p.nome.toLowerCase().includes(q.toLowerCase());}).slice(0,6);
-  if(!m.length){sug.classList.add('hidden');return;}
-  sug.innerHTML=m.map(function(p){return'<div class="px-4 py-2.5 text-sm cursor-pointer hover:bg-purple-50 font-medium text-gray-800" onclick="selecionarPac('+p.id+',\''+p.nome.replace(/\'/g,"\\'")+'\')">' +p.nome+' <span class="text-[10px] text-green-600 font-bold">cadastrado</span></div>';}).join('');
-  sug.classList.remove('hidden');
-}
-function selecionarPac(id,nome){
-  document.getElementById('pac-nome-input').value=nome;
-  document.getElementById('pac-id-hidden').value=id;
-  document.getElementById('pac-sugestoes').classList.add('hidden');
-  var v=document.getElementById('pac-vinculado');v.textContent='✓ Paciente cadastrado — sessão entrará no histórico pessoal.';v.classList.remove('hidden');
+function filtrarTerapeutas() {
+  const q = document.getElementById('busca-terapeuta')?.value.toLowerCase()||'';
+  document.querySelectorAll('.ter-item').forEach(el => {
+    const match = el.dataset.nome.includes(q) || el.dataset.email.includes(q);
+    el.classList.toggle('hidden', !match);
+  });
 }
 
-var allPacs = <?= json_encode(array_map(function($p){return['id'=>$p['id'],'nome'=>$p['nome'],'email'=>$p['email']];}, $pacientes)) ?>;
-function buscarPacs(q){
-  var r=document.getElementById('busca-res');
-  if(!q||q.length<2){r.classList.add('hidden');return;}
-  var m=allPacs.filter(function(p){return p.nome.toLowerCase().includes(q.toLowerCase());}).slice(0,5);
-  if(!m.length){r.classList.add('hidden');return;}
-  r.innerHTML=m.map(function(p){return'<div class="px-4 py-2.5 cursor-pointer hover:bg-purple-50"><div class="text-sm font-bold text-gray-800">'+p.nome+'</div><div class="text-xs text-gray-400">'+p.email+'</div></div>';}).join('');
-  r.classList.remove('hidden');
+// ── Histórico do paciente ─────────────────────────────────────────────────────
+async function abrirHistPaciente(pacUid, pnome) {
+  document.getElementById('hist-pac-titulo').textContent = 'Histórico — ' + pnome;
+  document.getElementById('hist-pac-body').innerHTML = '<div class="text-center py-8 text-on-surface-variant text-sm">Carregando...</div>';
+  abrirModal('modal-hist-pac');
+  try {
+    const d = await fetch(`../api/historico_paciente.php?pac_uid=${pacUid}`).then(r=>r.json());
+    const body = document.getElementById('hist-pac-body');
+    if (!d.ok || !d.ciclos.length) { body.innerHTML='<p class="text-sm text-on-surface-variant text-center py-8">Nenhum histórico anterior.</p>'; return; }
+    body.innerHTML = d.ciclos.map(c=>`
+      <div class="bg-surface-container-low rounded-2xl p-4 border border-outline-variant/20">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold text-primary uppercase tracking-widest">${c.status==='concluido'?'✅ Concluído':'❌ Cancelado'} · ${c.sessoes_realizadas} sessões</span>
+          <span class="text-xs text-outline">${c.periodo}</span>
+        </div>
+        ${c.anamnese?`<p class="text-xs text-on-surface-variant mb-1"><strong>Queixa:</strong> ${c.anamnese}</p>`:''}
+        ${c.praticas?`<p class="text-xs text-on-surface-variant"><strong>Práticas:</strong> ${c.praticas}</p>`:''}
+        ${c.terapeuta?`<p class="text-xs text-on-surface-variant mt-1"><strong>Terapeuta:</strong> ${c.terapeuta}</p>`:''}
+      </div>
+    `).join('');
+  } catch { document.getElementById('hist-pac-body').innerHTML='<p class="text-sm text-error text-center py-8">Erro ao carregar.</p>'; }
 }
-document.addEventListener('click',function(e){
-  if(!e.target.closest('#busca-global')&&!e.target.closest('#busca-res'))document.getElementById('busca-res').classList.add('hidden');
-  if(!e.target.closest('#pac-nome-input')&&!e.target.closest('#pac-sugestoes'))document.getElementById('pac-sugestoes').classList.add('hidden');
-});
 </script>
 </body>
 </html>
