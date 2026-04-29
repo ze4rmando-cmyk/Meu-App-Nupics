@@ -516,7 +516,12 @@ $stats_gerais = $pdo->query("SELECT
 </div>
 
 <?php elseif ($aba === 'terapeutas'): ?>
-<div class="mb-6"><h1 class="text-2xl font-extrabold text-primary">Gestão de Terapeutas</h1></div>
+<div class="mb-6 flex items-center justify-between">
+  <h1 class="text-2xl font-extrabold text-primary">Gestão de Terapeutas</h1>
+  <button onclick="abrirModal('modal-novo-terapeuta')" class="flex items-center gap-1.5 px-5 py-2.5 rounded-full bg-primary text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all">
+    <span class="material-symbols-outlined text-sm">person_add</span>Novo terapeuta
+  </button>
+</div>
 <div class="space-y-3">
   <?php foreach ($terapeutas_lista as $ter):
     $taxa_f = (int)$ter['total_sessoes_ter'] > 0 ? round(((int)$ter['total_faltas']/(int)$ter['total_sessoes_ter'])*100,1) : 0;
@@ -587,7 +592,14 @@ $stats_gerais = $pdo->query("SELECT
         </div>
       </div>
       <div class="text-center shrink-0"><p class="text-2xl font-extrabold text-primary"><?= $pac['total_ciclos'] ?></p><p class="text-[10px] text-on-surface-variant">ciclos</p></div>
-      <span class="material-symbols-outlined text-outline-variant hidden sm:block">chevron_right</span>
+      <div class="flex flex-col gap-1.5 shrink-0">
+        <span class="material-symbols-outlined text-outline-variant hidden sm:block">chevron_right</span>
+        <?php if ($bloq): ?>
+        <button onclick="event.stopPropagation();desbloquearPac(<?= $pac['id'] ?>,this)" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 hover:bg-emerald-200 whitespace-nowrap">Desbloquear</button>
+        <?php else: ?>
+        <button onclick="event.stopPropagation();abrirBloquearPac(<?= $pac['id'] ?>,'<?= addslashes($pac['nome']) ?>')" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-100 text-red-700 hover:bg-red-200 whitespace-nowrap">Bloquear</button>
+        <?php endif; ?>
+      </div>
     </div>
   </div>
   <?php endforeach; ?>
@@ -643,6 +655,40 @@ $ocu_pct = $vagas_t>0 ? round(($vagas_o/$vagas_t)*100) : 0;
     <?php endforeach; ?>
   </div>
   <?php endforeach; ?>
+</div>
+
+<div class="flex items-center justify-between mt-6 mb-3">
+  <h2 class="font-headline font-bold text-on-surface text-sm">Gerenciar slots</h2>
+  <button onclick="abrirModal('modal-novo-slot')" class="flex items-center gap-1 px-4 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90">
+    <span class="material-symbols-outlined text-sm">add</span>Novo slot
+  </button>
+</div>
+<div class="space-y-2">
+<?php
+$slots_gestao = $pdo->query("
+  SELECT s.*, u.nome AS ter_nome
+  FROM slots s JOIN usuarios u ON s.terapeuta_id=u.id
+  ORDER BY s.ativo DESC, s.dia_semana, s.hora_inicio
+")->fetchAll(PDO::FETCH_ASSOC);
+foreach ($slots_gestao as $sl):
+  $prats = $sl['praticas'] ? explode(',', $sl['praticas']) : [];
+?>
+<div class="glass rounded-2xl px-5 py-3 border border-outline-variant/20 flex flex-col sm:flex-row sm:items-center gap-3 <?= $sl['ativo'] ? '' : 'opacity-50' ?>">
+  <div class="flex-grow min-w-0">
+    <p class="font-bold text-sm text-on-surface"><?= htmlspecialchars($sl['ter_nome']) ?> · <?= $dias_full[(int)$sl['dia_semana']] ?> <?= substr($sl['hora_inicio'],0,5) ?>–<?= substr($sl['hora_fim'],0,5) ?></p>
+    <p class="text-xs text-on-surface-variant"><?= $sl['vagas_total'] ?> vaga(s) · <?= htmlspecialchars($sl['local']??'Sem local') ?></p>
+    <?php if ($prats): ?><div class="flex flex-wrap gap-1 mt-1"><?php foreach ($prats as $pr): ?><span class="text-[9px] font-bold px-2 py-0.5 rounded-full bg-primary/8 text-primary"><?= trim($pr) ?></span><?php endforeach; ?></div><?php endif; ?>
+  </div>
+  <div class="flex gap-2 shrink-0">
+    <button onclick="abrirEditSlot(<?= htmlspecialchars(json_encode($sl),ENT_QUOTES) ?>)" class="text-xs font-bold px-3 py-1.5 rounded-full border border-outline-variant/40 text-primary hover:bg-primary/5">Editar</button>
+    <?php if ($sl['ativo']): ?>
+    <button onclick="toggleSlot(<?= $sl['id'] ?>,0,this)" class="text-xs font-bold px-3 py-1.5 rounded-full border border-red-200 text-red-600 hover:bg-red-50">Desativar</button>
+    <?php else: ?>
+    <button onclick="toggleSlot(<?= $sl['id'] ?>,1,this)" class="text-xs font-bold px-3 py-1.5 rounded-full bg-emerald-600 text-white hover:opacity-90">Reativar</button>
+    <?php endif; ?>
+  </div>
+</div>
+<?php endforeach; ?>
 </div>
 
 <?php elseif ($aba === 'ciclos'): ?>
@@ -880,19 +926,57 @@ $ocu_pct = $vagas_t>0 ? round(($vagas_o/$vagas_t)*100) : 0;
   $perfil = $pdo->prepare("SELECT * FROM usuarios WHERE id=?");
   $perfil->execute([$uid]); $perfil = $perfil->fetch(PDO::FETCH_ASSOC);
 ?>
-<div class="max-w-2xl mx-auto">
-  <h1 class="text-2xl font-extrabold text-primary mb-6">Meu perfil</h1>
+<div class="max-w-2xl mx-auto space-y-6">
+  <h1 class="text-2xl font-extrabold text-primary">Meu perfil</h1>
+
+  <!-- Dados atuais -->
   <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-4">
-    <div class="flex items-center gap-5">
-      <div class="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center"><span class="material-symbols-outlined text-primary text-4xl">manage_accounts</span></div>
-      <div><h2 class="text-xl font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2><p class="text-sm text-on-surface-variant">Coordenador(a) NUPICS</p></div>
+    <div class="flex items-center gap-5 mb-2">
+      <div class="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center"><span class="material-symbols-outlined text-primary text-3xl">manage_accounts</span></div>
+      <div><h2 class="text-lg font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2><p class="text-xs text-on-surface-variant">Coordenador(a) NUPICS</p></div>
     </div>
     <?php foreach ([['E-mail','mail',$perfil['email']],['Telefone','phone',$perfil['telefone']??'Não informado'],['Membro desde','calendar_today',date('d/m/Y',strtotime($perfil['criado_em']))]] as [$l,$ic,$v]): ?>
-    <div class="flex items-center gap-4 bg-surface-container-low/60 rounded-2xl px-5 py-4 border border-outline-variant/15">
-      <span class="material-symbols-outlined text-secondary shrink-0"><?= $ic ?></span>
+    <div class="flex items-center gap-4 bg-surface-container-low/60 rounded-2xl px-5 py-3 border border-outline-variant/15">
+      <span class="material-symbols-outlined text-secondary shrink-0 text-lg"><?= $ic ?></span>
       <div><p class="text-[10px] font-bold uppercase text-on-surface-variant"><?= $l ?></p><p class="font-bold text-sm text-on-surface"><?= htmlspecialchars($v) ?></p></div>
     </div>
     <?php endforeach; ?>
+  </div>
+
+  <!-- Editar dados -->
+  <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-4">
+    <h3 class="font-headline font-bold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-primary text-lg">edit</span>Editar dados</h3>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Nome completo</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">badge</span></span><input type="text" id="perf-nome" value="<?= htmlspecialchars($perfil['nome']) ?>"/></div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Telefone</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">phone</span></span><input type="text" id="perf-tel" value="<?= htmlspecialchars($perfil['telefone']??'') ?>" placeholder="(00) 00000-0000"/></div>
+    </div>
+    <button onclick="salvarPerfil()" class="px-6 py-3 rounded-full bg-primary text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all flex items-center gap-2">
+      <span class="material-symbols-outlined text-sm">save</span>Salvar alterações
+    </button>
+  </div>
+
+  <!-- Alterar senha -->
+  <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-4">
+    <h3 class="font-headline font-bold text-on-surface flex items-center gap-2"><span class="material-symbols-outlined text-secondary text-lg">lock</span>Alterar senha</h3>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Senha atual</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">lock</span></span><input type="password" id="sen-atual" placeholder="••••••••"/></div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Nova senha</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span></span><input type="password" id="sen-nova" placeholder="Mínimo 6 caracteres"/></div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Confirmar nova senha</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span></span><input type="password" id="sen-conf" placeholder="Repita a senha"/></div>
+    </div>
+    <button onclick="alterarSenha()" class="px-6 py-3 rounded-full bg-secondary text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all flex items-center gap-2">
+      <span class="material-symbols-outlined text-sm">key</span>Alterar senha
+    </button>
   </div>
 </div>
 <?php endif; ?>
@@ -1031,6 +1115,159 @@ $ocu_pct = $vagas_t>0 ? round(($vagas_o/$vagas_t)*100) : 0;
       <button onclick="fecharModal('modal-hist-pac')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest transition-colors"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
     </div>
     <div id="hist-pac-body" class="overflow-y-auto px-6 pb-6 flex-1"><div class="text-center py-8 text-on-surface-variant text-sm">Carregando...</div></div>
+  </div>
+</div>
+
+
+<!-- ── Modal: Bloquear paciente ─────────────────────────────────── -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-bloquear-pac">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-bloquear-pac')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-7">
+    <h2 class="text-lg font-extrabold text-red-600 mb-1">Bloquear paciente</h2>
+    <p id="bloq-nome" class="text-sm text-on-surface-variant mb-5"></p>
+    <input type="hidden" id="bloq-uid"/>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Bloqueado até</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span><input type="date" id="bloq-data"/></div>
+      </div>
+      <p class="text-xs text-on-surface-variant">O paciente não conseguirá agendar novas sessões até esta data.</p>
+      <div class="flex gap-3">
+        <button onclick="confirmarBloquearPac()" class="flex-grow py-3 rounded-full bg-red-600 text-white font-bold text-sm hover:opacity-90">Confirmar bloqueio</button>
+        <button onclick="fecharModal('modal-bloquear-pac')" class="px-5 py-3 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm">Cancelar</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Novo slot ──────────────────────────────────────────── -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-novo-slot">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-novo-slot')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 class="text-lg font-extrabold text-primary">Novo slot de atendimento</h2>
+      <button onclick="fecharModal('modal-novo-slot')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-4">
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Terapeuta</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">medical_services</span></span>
+          <select id="ns-ter">
+            <?php foreach ($todos_terapeutas as $tt): ?>
+            <option value="<?= $tt['id'] ?>"><?= htmlspecialchars($tt['nome']) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Dia da semana</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_month</span></span>
+            <select id="ns-dia">
+              <?php foreach ($dias_full as $k=>$v): ?><option value="<?= $k ?>"><?= $v ?></option><?php endforeach; ?>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Vagas</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">group</span></span><input type="number" id="ns-vagas" value="1" min="1" max="20"/></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora início</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span><input type="time" id="ns-hi"/></div>
+        </div>
+        <div>
+          <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora fim</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span><input type="time" id="ns-hf"/></div>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Local</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span><input type="text" id="ns-local" placeholder="Ex: Sala 3 – UERN Caicó"/></div>
+      </div>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-2">Práticas oferecidas</label>
+        <div class="flex flex-wrap gap-2">
+          <?php foreach ($praticas_opcoes as $po): ?><label class="pill-opt"><input type="checkbox" class="ns-prat-cb" value="<?= $po ?>"><?= $po ?></label><?php endforeach; ?>
+        </div>
+      </div>
+      <input type="hidden" id="ns-praticas"/>
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Descrição (opcional)</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">notes</span></span><input type="text" id="ns-desc" placeholder="Informação extra..."/></div>
+      </div>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="ns-acei" checked class="rounded"> Aceita interno</label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="ns-acee" checked class="rounded"> Aceita externo</label>
+      </div>
+      <button onclick="document.getElementById('ns-praticas').value=[...document.querySelectorAll('.ns-prat-cb:checked')].map(c=>c.value).join(',');salvarNovoSlot()" class="w-full py-3.5 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">add_circle</span>Criar slot
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Editar slot ────────────────────────────────────────── -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-edit-slot">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-edit-slot')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 class="text-lg font-extrabold text-primary">Editar slot</h2>
+      <button onclick="fecharModal('modal-edit-slot')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-4">
+      <input type="hidden" id="edit-slot-id"/>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora início</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span><input type="time" id="edit-slot-hi"/></div></div>
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Hora fim</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">schedule</span></span><input type="time" id="edit-slot-hf"/></div></div>
+        <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Vagas</label>
+          <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">group</span></span><input type="number" id="edit-slot-vagas" min="1" max="20"/></div></div>
+      </div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Local</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">location_on</span></span><input type="text" id="edit-slot-local"/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Práticas (separadas por vírgula)</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">spa</span></span><input type="text" id="edit-slot-praticas" placeholder="Reiki, Acupuntura..."/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Descrição</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">notes</span></span><input type="text" id="edit-slot-desc"/></div></div>
+      <div class="flex gap-4">
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="edit-slot-acei" class="rounded"> Aceita interno</label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="edit-slot-acee" class="rounded"> Aceita externo</label>
+      </div>
+      <button onclick="salvarEditSlot()" class="w-full py-3.5 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all">Salvar alterações</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal: Novo terapeuta ─────────────────────────────────────── -->
+<div class="modal-wrap fixed inset-0 z-[100] items-end sm:items-center justify-center p-0 sm:p-4" id="modal-novo-terapeuta">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-novo-terapeuta')"></div>
+  <div class="glass modal-card relative z-10 w-full sm:max-w-lg rounded-t-[2rem] sm:rounded-[2rem] shadow-2xl flex flex-col max-h-[90vh] overflow-hidden">
+    <div class="flex items-center justify-between px-6 pt-6 pb-3 shrink-0">
+      <h2 class="text-lg font-extrabold text-primary">Cadastrar terapeuta</h2>
+      <button onclick="fecharModal('modal-novo-terapeuta')" class="w-9 h-9 flex items-center justify-center rounded-full bg-surface-container-high hover:bg-surface-container-highest"><span class="material-symbols-outlined text-base text-on-surface-variant">close</span></button>
+    </div>
+    <div class="overflow-y-auto px-6 pb-6 flex-1 space-y-3">
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Nome completo *</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">badge</span></span><input type="text" id="nt-nome" placeholder="Nome completo"/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">E-mail *</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">mail</span></span><input type="email" id="nt-email" placeholder="email@uern.br"/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Telefone</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">phone</span></span><input type="text" id="nt-tel" placeholder="(00) 00000-0000"/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Especialidade *</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">spa</span></span><input type="text" id="nt-esp" placeholder="Ex: Acupuntura, Reiki..."/></div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Período</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">school</span></span>
+          <select id="nt-periodo"><option value="">Selecione</option><?php foreach(['Matutino','Vespertino','Noturno','Integral'] as $p): ?><option value="<?= $p ?>"><?= $p ?></option><?php endforeach; ?></select>
+        </div></div>
+      <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Senha inicial *</label>
+        <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">lock</span></span><input type="password" id="nt-senha" placeholder="Mínimo 6 caracteres"/></div></div>
+      <p class="text-xs text-on-surface-variant">O terapeuta poderá alterar a senha no primeiro acesso.</p>
+      <button onclick="salvarNovoTerapeuta()" class="w-full py-3.5 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
+        <span class="material-symbols-outlined text-sm">person_add</span>Cadastrar terapeuta
+      </button>
+    </div>
   </div>
 </div>
 
@@ -1204,14 +1441,135 @@ async function salvarNovaVisita(e){
   const form=document.getElementById('form-nova-visita');
   const fd=new FormData(form);
   const prats=[...document.querySelectorAll('.nova-vis-prat:checked')].map(c=>c.value).join(', ');
-  fd.set('praticas_solicitadas',prats);fd.set('acao','nova_visita');
-  // Insere direto na tabela via fetch (simplificado)
-  toast('Solicitação registrada!','check_circle','text-emerald-600');
-  fecharModal('modal-nova-visita');
-  setTimeout(()=>location.reload(),1000);
+  fd.set('praticas_solicitadas',prats);
+  fd.set('acao','nova_visita');
+  const btn=form.querySelector('button[type=submit]');
+  btn.disabled=true;btn.textContent='Salvando...';
+  const d=await fetch('../api/coord_action.php',{method:'POST',body:fd}).then(r=>r.json()).catch(()=>({ok:false,msg:'Erro de conexão.'}));
+  btn.disabled=false;btn.textContent='Registrar solicitação';
+  if(d.ok){
+    toast('Solicitação registrada!','check_circle','text-emerald-600');
+    fecharModal('modal-nova-visita');
+    setTimeout(()=>location.reload(),1200);
+  } else {
+    toast(d.msg||'Erro ao salvar.','error','text-red-500');
+  }
 }
 
 // Histórico paciente
+// Perfil
+async function salvarPerfil(){
+  const nome=document.getElementById('perf-nome').value.trim();
+  const tel=document.getElementById('perf-tel').value.trim();
+  if(!nome){toast('Nome não pode ficar vazio.','error','text-red-500');return}
+  const d=await api('../api/coord_action.php',{acao:'editar_perfil',nome,telefone:tel});
+  if(d.ok){toast('Perfil atualizado!','check_circle','text-emerald-600')}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+async function alterarSenha(){
+  const atual=document.getElementById('sen-atual').value;
+  const nova=document.getElementById('sen-nova').value;
+  const conf=document.getElementById('sen-conf').value;
+  if(!atual||!nova||!conf){toast('Preencha todos os campos.','error','text-red-500');return}
+  if(nova.length<6){toast('A nova senha deve ter pelo menos 6 caracteres.','error','text-red-500');return}
+  if(nova!==conf){toast('As senhas não coincidem.','error','text-red-500');return}
+  const d=await api('../api/coord_action.php',{acao:'alterar_senha',senha_atual:atual,senha_nova:nova,confirmar:conf});
+  if(d.ok){toast('Senha alterada!','lock','text-emerald-600');document.getElementById('sen-atual').value='';document.getElementById('sen-nova').value='';document.getElementById('sen-conf').value=''}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+// Bloquear paciente
+function abrirBloquearPac(uid,nome){
+  document.getElementById('bloq-uid').value=uid;
+  document.getElementById('bloq-nome').textContent=nome;
+  const d=new Date();d.setDate(d.getDate()+30);
+  document.getElementById('bloq-data').value=d.toISOString().slice(0,10);
+  abrirModal('modal-bloquear-pac');
+}
+async function confirmarBloquearPac(){
+  const uid=document.getElementById('bloq-uid').value;
+  const ate=document.getElementById('bloq-data').value;
+  if(!ate){toast('Informe a data de bloqueio.','error','text-red-500');return}
+  const d=await api('../api/coord_action.php',{acao:'bloquear_paciente',paciente_id:uid,bloqueado_ate:ate});
+  if(d.ok){toast(d.msg,'block','text-red-500');fecharModal('modal-bloquear-pac');setTimeout(()=>location.reload(),1000)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+async function desbloquearPac(uid,btn){
+  if(!confirm('Desbloquear este paciente?'))return;btn.disabled=true;
+  const d=await api('../api/coord_action.php',{acao:'desbloquear_paciente',paciente_id:uid});
+  if(d.ok){toast('Paciente desbloqueado.','lock_open','text-emerald-600');setTimeout(()=>location.reload(),900)}
+  else{toast(d.msg||'Erro.','error','text-red-500');btn.disabled=false}
+}
+// Slots
+async function toggleSlot(sid,ativo,btn){
+  btn.disabled=true;
+  const d=await api('../api/coord_action.php',{acao:ativo?'reativar_slot':'desativar_slot',slot_id:sid});
+  if(d.ok){toast(d.msg,'check_circle','text-emerald-600');setTimeout(()=>location.reload(),900)}
+  else{toast(d.msg||'Erro.','error','text-red-500');btn.disabled=false}
+}
+function abrirEditSlot(sl){
+  document.getElementById('edit-slot-id').value=sl.id;
+  document.getElementById('edit-slot-hi').value=sl.hora_inicio.slice(0,5);
+  document.getElementById('edit-slot-hf').value=sl.hora_fim.slice(0,5);
+  document.getElementById('edit-slot-vagas').value=sl.vagas_total;
+  document.getElementById('edit-slot-local').value=sl.local||'';
+  document.getElementById('edit-slot-praticas').value=sl.praticas||'';
+  document.getElementById('edit-slot-desc').value=sl.descricao||'';
+  document.getElementById('edit-slot-acei').checked=sl.aceita_interno==1;
+  document.getElementById('edit-slot-acee').checked=sl.aceita_externo==1;
+  abrirModal('modal-edit-slot');
+}
+async function salvarEditSlot(){
+  const sid=document.getElementById('edit-slot-id').value;
+  const d=await api('../api/coord_action.php',{
+    acao:'editar_slot',slot_id:sid,
+    hora_inicio:document.getElementById('edit-slot-hi').value,
+    hora_fim:document.getElementById('edit-slot-hf').value,
+    vagas_total:document.getElementById('edit-slot-vagas').value,
+    local:document.getElementById('edit-slot-local').value,
+    praticas:document.getElementById('edit-slot-praticas').value,
+    descricao:document.getElementById('edit-slot-desc').value,
+    ...(document.getElementById('edit-slot-acei').checked?{aceita_interno:'1'}:{}),
+    ...(document.getElementById('edit-slot-acee').checked?{aceita_externo:'1'}:{}),
+  });
+  if(d.ok){toast('Slot atualizado!','check_circle','text-emerald-600');fecharModal('modal-edit-slot');setTimeout(()=>location.reload(),1000)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+async function salvarNovoSlot(){
+  const d=await api('../api/coord_action.php',{
+    acao:'criar_slot',
+    terapeuta_id:document.getElementById('ns-ter').value,
+    dia_semana:document.getElementById('ns-dia').value,
+    hora_inicio:document.getElementById('ns-hi').value,
+    hora_fim:document.getElementById('ns-hf').value,
+    vagas_total:document.getElementById('ns-vagas').value,
+    local:document.getElementById('ns-local').value,
+    praticas:document.getElementById('ns-praticas').value,
+    descricao:document.getElementById('ns-desc').value,
+    ...(document.getElementById('ns-acei').checked?{aceita_interno:'1'}:{}),
+    ...(document.getElementById('ns-acee').checked?{aceita_externo:'1'}:{}),
+  });
+  if(d.ok){toast('Slot criado!','check_circle','text-emerald-600');fecharModal('modal-novo-slot');setTimeout(()=>location.reload(),1000)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+// Novo terapeuta
+async function salvarNovoTerapeuta(){
+  const d=await api('../api/coord_action.php',{
+    acao:'criar_terapeuta',
+    nome:document.getElementById('nt-nome').value,
+    email:document.getElementById('nt-email').value,
+    telefone:document.getElementById('nt-tel').value,
+    especialidade:document.getElementById('nt-esp').value,
+    periodo:document.getElementById('nt-periodo').value,
+    senha:document.getElementById('nt-senha').value,
+  });
+  if(d.ok){toast(d.msg,'person_add','text-emerald-600');fecharModal('modal-novo-terapeuta');setTimeout(()=>location.reload(),1200)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+// Auto-refresh do painel a cada 60s
+<?php if ($aba === 'painel'): ?>
+setInterval(()=>location.reload(), 60000);
+<?php endif; ?>
+
 async function abrirHistPac(pacUid,pnome){
   document.getElementById('hist-pac-titulo').textContent='Histórico — '+pnome;
   document.getElementById('hist-pac-body').innerHTML='<div class="text-center py-8 text-on-surface-variant text-sm">Carregando...</div>';
