@@ -595,9 +595,9 @@ $stats_gerais = $pdo->query("SELECT
       <div class="flex flex-col gap-1.5 shrink-0">
         <span class="material-symbols-outlined text-outline-variant hidden sm:block">chevron_right</span>
         <?php if ($bloq): ?>
-        <button onclick="event.stopPropagation();desbloquearPac(<?= $pac['id'] ?>,this)" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 hover:bg-emerald-200 whitespace-nowrap">Desbloquear</button>
+        <button onclick="event.stopPropagation();desbloquearPac(this.dataset.id,this)" data-id="<?= $pac['id'] ?>" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 hover:bg-emerald-200 whitespace-nowrap">Desbloquear</button>
         <?php else: ?>
-        <button onclick="event.stopPropagation();abrirBloquearPac(<?= $pac['id'] ?>,'<?= addslashes($pac['nome']) ?>')" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-100 text-red-700 hover:bg-red-200 whitespace-nowrap">Bloquear</button>
+        <button onclick="event.stopPropagation();abrirBloquearPac(this.dataset.id,this.dataset.nome)" data-id="<?= $pac['id'] ?>" data-nome="<?= htmlspecialchars($pac['nome'], ENT_QUOTES) ?>" class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-100 text-red-700 hover:bg-red-200 whitespace-nowrap">Bloquear</button>
         <?php endif; ?>
       </div>
     </div>
@@ -680,7 +680,7 @@ foreach ($slots_gestao as $sl):
     <?php if ($prats): ?><div class="flex flex-wrap gap-1 mt-1"><?php foreach ($prats as $pr): ?><span class="text-[9px] font-bold px-2 py-0.5 rounded-full bg-primary/8 text-primary"><?= trim($pr) ?></span><?php endforeach; ?></div><?php endif; ?>
   </div>
   <div class="flex gap-2 shrink-0">
-    <button onclick="abrirEditSlot(<?= htmlspecialchars(json_encode($sl),ENT_QUOTES) ?>)" class="text-xs font-bold px-3 py-1.5 rounded-full border border-outline-variant/40 text-primary hover:bg-primary/5">Editar</button>
+    <button onclick="abrirEditSlot(JSON.parse(this.dataset.sl))" data-sl="<?= htmlspecialchars(json_encode($sl)) ?>" class="text-xs font-bold px-3 py-1.5 rounded-full border border-outline-variant/40 text-primary hover:bg-primary/5">Editar</button>
     <?php if ($sl['ativo']): ?>
     <button onclick="toggleSlot(<?= $sl['id'] ?>,0,this)" class="text-xs font-bold px-3 py-1.5 rounded-full border border-red-200 text-red-600 hover:bg-red-50">Desativar</button>
     <?php else: ?>
@@ -884,14 +884,37 @@ foreach ($slots_gestao as $sl):
 
 <?php elseif ($aba === 'relatorios'): ?>
 <div class="mb-6"><h1 class="text-2xl font-extrabold text-primary">Relatórios</h1></div>
-<form method="GET" class="glass rounded-2xl p-5 mb-7 border border-outline-variant/20 flex flex-wrap items-end gap-4">
-  <input type="hidden" name="aba" value="relatorios"/>
-  <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Data início</label>
-    <div class="campo w-44"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span><input type="date" name="ini" value="<?= htmlspecialchars($periodo_ini) ?>"/></div></div>
-  <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Data fim</label>
-    <div class="campo w-44"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span><input type="date" name="fim" value="<?= htmlspecialchars($periodo_fim) ?>"/></div></div>
-  <button type="submit" class="px-6 py-3 rounded-full bg-primary text-white text-sm font-bold hover:opacity-90">Gerar</button>
-</form>
+<div class="glass rounded-2xl p-5 mb-7 border border-outline-variant/20 flex flex-wrap items-end gap-4">
+  <div>
+    <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Data início</label>
+    <div class="campo w-44"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span><input type="date" id="rel-ini" value="<?= htmlspecialchars($periodo_ini) ?>"/></div>
+  </div>
+  <div>
+    <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Data fim</label>
+    <div class="campo w-44"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">calendar_today</span></span><input type="date" id="rel-fim" value="<?= htmlspecialchars($periodo_fim) ?>"/></div>
+  </div>
+  <div class="flex gap-2">
+    <button onclick="filtrarRelatorio()" class="px-5 py-3 rounded-full border-2 border-primary text-primary text-sm font-bold hover:bg-primary/5 active:scale-95 transition-all flex items-center gap-1.5">
+      <span class="material-symbols-outlined text-sm">refresh</span>Filtrar
+    </button>
+    <button onclick="gerarPDF()" class="px-6 py-3 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all flex items-center gap-2 shadow-lg">
+      <span class="material-symbols-outlined text-sm">picture_as_pdf</span>Gerar relatório PDF
+    </button>
+  </div>
+</div>
+<script>
+function filtrarRelatorio(){
+  const ini=document.getElementById('rel-ini').value;
+  const fim=document.getElementById('rel-fim').value;
+  location.href='?aba=relatorios&ini='+ini+'&fim='+fim;
+}
+function gerarPDF(){
+  const ini=document.getElementById('rel-ini').value;
+  const fim=document.getElementById('rel-fim').value;
+  if(!ini||!fim){toast('Selecione o período.','error','text-red-500');return}
+  window.open('relatorio_pdf.php?ini='+ini+'&fim='+fim,'_blank');
+}
+</script>
 <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mb-7">
   <?php foreach ([
     ['Plantões realizados', $rel_data['plt_realizados'],      'local_hospital','text-emerald-700','bg-emerald-50'],
@@ -1493,7 +1516,8 @@ async function confirmarBloquearPac(){
   if(d.ok){toast(d.msg,'block','text-red-500');fecharModal('modal-bloquear-pac');setTimeout(()=>location.reload(),1000)}
   else toast(d.msg||'Erro.','error','text-red-500');
 }
-async function desbloquearPac(uid,btn){
+async function desbloquearPac(uid_or_el,btn){
+  const uid = typeof uid_or_el === 'object' ? uid_or_el.dataset?.id || uid_or_el : uid_or_el;
   if(!confirm('Desbloquear este paciente?'))return;btn.disabled=true;
   const d=await api('../api/coord_action.php',{acao:'desbloquear_paciente',paciente_id:uid});
   if(d.ok){toast('Paciente desbloqueado.','lock_open','text-emerald-600');setTimeout(()=>location.reload(),900)}
@@ -1566,9 +1590,8 @@ async function salvarNovoTerapeuta(){
   else toast(d.msg||'Erro.','error','text-red-500');
 }
 // Auto-refresh do painel a cada 60s
-<?php if ($aba === 'painel'): ?>
-setInterval(()=>location.reload(), 60000);
-<?php endif; ?>
+const _abaAtual = <?= json_encode($aba) ?>;
+if (_abaAtual === 'painel') setInterval(() => location.reload(), 60000);
 
 async function abrirHistPac(pacUid,pnome){
   document.getElementById('hist-pac-titulo').textContent='Histórico — '+pnome;
