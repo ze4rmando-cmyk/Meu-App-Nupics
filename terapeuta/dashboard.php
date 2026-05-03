@@ -1,7 +1,7 @@
 <?php
 session_start();
 if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'terapeuta') {
-    header('Location: ../index.php'); exit;
+    header('Location: ../login.php'); exit;
 }
 require_once '../config/db.php';
 
@@ -34,9 +34,10 @@ $stats->execute([$uid,$uid,$uid,$uid,$uid]); $stats = $stats->fetch(PDO::FETCH_A
 // ── Plantão aberto hoje ───────────────────────────────────────────────────────
 $plt_stmt = $pdo->prepare("SELECT p.*, COUNT(sp.id) AS total_atendidos
     FROM plantoes p LEFT JOIN sessoes_plantao sp ON sp.plantao_id=p.id
-    WHERE p.terapeuta_id=? AND p.data=CURDATE() AND p.status='aberto'
+    WHERE p.terapeuta_id=? AND p.data=? AND p.status='aberto'
     GROUP BY p.id LIMIT 1");
-$plt_stmt->execute([$uid]); $plantao_aberto = $plt_stmt->fetch(PDO::FETCH_ASSOC);
+$hoje_php = date('Y-m-d');
+$plt_stmt->execute([$uid, $hoje_php]); $plantao_aberto = $plt_stmt->fetch(PDO::FETCH_ASSOC);
 
 // ── Dados específicos por aba ─────────────────────────────────────────────────
 $ciclos = $pendentes = $meus_slots = $pacientes_lista = $terapeutas_lista = $atividade = [];
@@ -85,6 +86,7 @@ if ($aba === 'painel') {
 }
 
 if ($aba === 'cronograma') {
+    // Meus slots
     $meus_slots = $pdo->prepare("
         SELECT s.*,
           (SELECT COUNT(*) FROM reservas r WHERE r.slot_id=s.id AND r.status NOT IN ('cancelado') AND r.data_sessao>=CURDATE()) AS reservas_ativas,
@@ -92,12 +94,77 @@ if ($aba === 'cronograma') {
         FROM slots s WHERE s.terapeuta_id=? ORDER BY s.dia_semana, s.hora_inicio
     ");
     $meus_slots->execute([$uid]); $meus_slots = $meus_slots->fetchAll(PDO::FETCH_ASSOC);
-    // Para cada slot, busca pacientes agendados
     foreach ($meus_slots as &$sl) {
         $pac = $pdo->prepare("SELECT u.nome FROM reservas r JOIN usuarios u ON r.paciente_id=u.id
             WHERE r.slot_id=? AND r.status NOT IN ('cancelado') AND r.data_sessao=?");
         $pac->execute([$sl['id'], $sl['prox_data']]);
         $sl['pac_nomes'] = $pac->fetchAll(PDO::FETCH_COLUMN);
+    } unset($sl);
+
+    // TODOS os slots de todos os terapeutas (para o painel de macas)
+    $todos_slots_raw = $pdo->query("
+        SELECT s.*, u.nome AS ter_nome, u.id AS ter_uid,
+          (SELECT COUNT(*) FROM reservas r WHERE r.slot_id=s.id AND r.status NOT IN ('cancelado') AND r.data_sessao>=CURDATE()) AS reservas_ativas,
+          DATE_ADD(CURDATE(), INTERVAL MOD(s.dia_semana-1-WEEKDAY(CURDATE())+7,7) DAY) AS prox_data
+        FROM slots s
+        JOIN usuarios u ON s.terapeuta_id=u.id
+        JOIN terapeutas t ON t.usuario_id=u.id
+        WHERE s.ativo=1 AND t.ativo=1
+        ORDER BY s.dia_semana, s.hora_inicio
+    ")->fetchAll(PDO::FETCH_ASSOC);
+
+    // Agrupa por (dia, hora_inicio) para detectar conflitos de maca
+    // Um horário entra em conflito com outro se os intervalos se sobrepõem
+    // Regra: máx 2 macas disponíveis — conflito quando >=3 terapeutas têm slots sobrepostos
+    // Também marca como ocupado quando >=2 (aviso amarelo) e >=3 (vermelho)
+    $slots_por_dia_hora = [];
+    foreach ($todos_slots_raw as &$sl) {
+        $pac = $pdo->prepare("SELECT u.nome FROM reservas r JOIN usuarios u ON r.paciente_id=u.id
+            WHERE r.slot_id=? AND r.status NOT IN ('cancelado') AND r.data_sessao=?");
+        $pac->execute([$sl['id'], $sl['prox_data']]);
+        $sl['pac_nomes'] = $pac->fetchAll(PDO::FETCH_COLUMN);
+        $sl['e_meu'] = ($sl['ter_uid'] == $uid);
+    } unset($sl);
+
+    // Detecta sobreposição de horários: para cada par de slots no mesmo dia, verifica se os intervalos se cruzam
+    // Monta índice: dia -> lista de slots com hora_inicio/hora_fim
+    $conflitos = []; // [dia][hora_inicio_str] => lista de ter_nomes
+    foreach ($todos_slots_raw as $sl) {
+        $d  = (int)$sl['dia_semana'];
+        $hi = $sl['hora_inicio'];
+        $hf = $sl['hora_fim'];
+        // Para cada outro slot no mesmo dia, verifica sobreposição
+        foreach ($todos_slots_raw as $sl2) {
+            if ($sl2['id'] === $sl['id']) continue;
+            if ((int)$sl2['dia_semana'] !== $d) continue;
+            // Verifica sobreposição: (hi1 < hf2) && (hi2 < hf1)
+            if ($hi < $sl2['hora_fim'] && $sl2['hora_inicio'] < $hf) {
+                $key = $d.'_'.$hi.'_'.$hf;
+                if (!isset($conflitos[$key])) $conflitos[$key] = ['slots'=>[],'ter'=>[]];
+                $conflitos[$key]['slots'][] = $sl['id'];
+                $conflitos[$key]['ter'][] = $sl['ter_nome'];
+            }
+        }
+    }
+    // Conta quantos terapeutas únicos por janela de tempo por dia
+    // Simplificado: para cada slot, conta quantos outros slots do mesmo dia se sobrepõem
+    foreach ($todos_slots_raw as &$sl) {
+        $count = 0;
+        $d  = (int)$sl['dia_semana'];
+        $hi = $sl['hora_inicio'];
+        $hf = $sl['hora_fim'];
+        $nomes_conflit = [];
+        foreach ($todos_slots_raw as $sl2) {
+            if ($sl2['id'] === $sl['id']) continue;
+            if ((int)$sl2['dia_semana'] !== $d) continue;
+            if ($hi < $sl2['hora_fim'] && $sl2['hora_inicio'] < $hf) {
+                $count++;
+                $nomes_conflit[] = $sl2['ter_nome'];
+            }
+        }
+        $sl['sobrepostos']       = $count;          // quantos outros slots se sobrepõem
+        $sl['nomes_sobrepostos'] = array_unique($nomes_conflit);
+        $sl['total_no_horario']  = $count + 1;       // inclui ele mesmo
     } unset($sl);
 }
 
@@ -200,13 +267,29 @@ $stats_gerais = $pdo->query("SELECT
   .pdot.done{background:#4e0078;color:#fff}.pdot.curr{background:#4e0078;color:#fff;box-shadow:0 0 0 3px rgba(78,0,120,.2)}.pdot.idle{background:#ecdeed;color:#7f7383}
 
   /* Cronograma grid */
-  .cron-cell{min-height:80px;border-right:1px solid #ecdeed;border-bottom:1px solid #ecdeed;padding:6px;vertical-align:top}
-  .cron-slot{border-radius:10px;padding:8px 10px;margin-bottom:4px;font-size:.75rem;cursor:pointer;transition:.15s}
-  .cron-slot:hover{filter:brightness(.95)}
-  .cron-slot.tipo-ciclo{background:#4e0078;color:#fff}
-  .cron-slot.tipo-plantao{background:linear-gradient(135deg,#4e0078,#b7004d);color:#fff}
+  .cron-cell{min-height:88px;border-right:1px solid #ecdeed;border-bottom:1px solid #ecdeed;padding:5px;vertical-align:top}
+  .cron-slot{border-radius:10px;padding:7px 9px;margin-bottom:3px;font-size:.72rem;cursor:pointer;transition:.15s}
+  .cron-slot:hover{filter:brightness(.94)}
+  /* Meu slot */
+  .cron-slot.meu-slot{background:#4e0078;color:#fff}
+  .cron-slot.meu-slot.aviso{background:linear-gradient(135deg,#4e0078,#d97706);color:#fff}
+  .cron-slot.meu-slot.conflito{background:linear-gradient(135deg,#4e0078,#dc2626);color:#fff}
+  /* Slot de outro terapeuta */
+  .cron-slot.outro-slot{background:#e0d6f7;color:#3b0066;border:1.5px solid #c4b1eb}
+  .cron-slot.outro-slot.aviso{background:#fef3c7;color:#92400e;border-color:#fbbf24}
+  .cron-slot.outro-slot.conflito{background:#fee2e2;color:#7f1d1d;border-color:#f87171}
+  /* Livre */
   .cron-slot.tipo-livre{border:2px dashed #d0c2d3;background:transparent;color:#7f7383;text-align:center}
   .cron-slot.tipo-livre:hover{background:rgba(78,0,120,.05);border-color:#4e0078;color:#4e0078}
+  /* Badge de maca */
+  .maca-badge{display:inline-flex;align-items:center;justify-content:center;font-size:.6rem;font-weight:800;
+              width:16px;height:16px;border-radius:50%;flex-shrink:0}
+  .maca-ok{background:#22c55e;color:#fff}
+  .maca-aviso{background:#f59e0b;color:#fff}
+  .maca-cheia{background:#ef4444;color:#fff}
+  /* Pulse animation para conflito */
+  @keyframes pulse-red{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.3)}50%{box-shadow:0 0 0 6px rgba(239,68,68,0)}}
+  .cron-slot.conflito.meu-slot{animation:pulse-red 2s infinite}
 
   /* Aviso tipo */
   .av-evento{border-left:3px solid #4e0078}.av-urgente{border-left:3px solid #b7004d}
@@ -601,73 +684,182 @@ $stats_gerais = $pdo->query("SELECT
   <?php endforeach; ?>
 </div>
 
-<!-- Grade do cronograma estilo Stitch -->
+<?php
+// ── Agrupa todos os slots (meus + outros) por dia/hora para a grade ──────────
+$por_hora_todos = [];
+foreach ($todos_slots_raw as $sl) {
+    $h = substr($sl['hora_inicio'],0,5);
+    // Cada célula pode ter múltiplos slots (vários terapeutas)
+    $por_hora_todos[$h][(int)$sl['dia_semana']][] = $sl;
+}
+// Meus slots também indexados separado para clique de edição
+$meus_por_hora = [];
+foreach ($meus_slots as $sl) {
+    $meus_por_hora[substr($sl['hora_inicio'],0,5)][(int)$sl['dia_semana']] = $sl;
+}
+$horas_exib = [];
+for ($h=7;$h<=18;$h+=2) $horas_exib[]=sprintf('%02d:00',$h);
+$horas_todas = array_unique(array_merge($horas_exib, array_keys($por_hora_todos)));
+sort($horas_todas);
+?>
+
+<!-- Legenda de macas -->
+<div class="flex flex-wrap items-center gap-4 mb-4 px-1">
+  <p class="text-xs font-bold text-on-surface-variant uppercase tracking-widest">Ocupação das macas:</p>
+  <div class="flex items-center gap-1.5"><span class="maca-badge maca-ok">1</span><span class="text-xs text-on-surface-variant">1 terapeuta — livre</span></div>
+  <div class="flex items-center gap-1.5"><span class="maca-badge maca-aviso">2</span><span class="text-xs text-on-surface-variant">2 terapeutas — macas cheias</span></div>
+  <div class="flex items-center gap-1.5"><span class="maca-badge maca-cheia">3+</span><span class="text-xs text-on-surface-variant">3+ terapeutas — <strong>conflito!</strong></span></div>
+  <div class="flex items-center gap-1.5"><div class="w-3 h-3 rounded bg-[#4e0078]"></div><span class="text-xs text-on-surface-variant">Meu horário</span></div>
+  <div class="flex items-center gap-1.5"><div class="w-3 h-3 rounded bg-[#e0d6f7] border border-[#c4b1eb]"></div><span class="text-xs text-on-surface-variant">Outro terapeuta</span></div>
+</div>
+
+<!-- Grade do cronograma compartilhado -->
 <div class="glass rounded-2xl overflow-hidden border border-outline-variant/20 mb-7">
   <!-- Header da grade -->
-  <div class="grid border-b border-outline-variant/20 bg-surface-container-low/60" style="grid-template-columns:80px repeat(5,1fr)">
+  <div class="grid border-b border-outline-variant/20 bg-surface-container-low/60" style="grid-template-columns:72px repeat(5,1fr)">
     <div class="p-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant text-center">Horário</div>
-    <?php foreach ($dias_full as $d): ?>
-    <div class="p-3 text-center font-bold text-on-surface text-sm border-l border-outline-variant/20"><?= $d ?></div>
-    <?php endforeach; ?>
-  </div>
-
-  <?php
-  // Agrupa slots por hora
-  $por_hora = [];
-  foreach ($meus_slots as $sl) {
-      $h = substr($sl['hora_inicio'],0,5);
-      $por_hora[$h][$sl['dia_semana']] = $sl;
-  }
-  ksort($por_hora);
-
-  // Gera horários de 07:00 a 18:00 a cada 2h para exibição
-  $horas_exib = [];
-  for ($h=7; $h<=18; $h+=2) $horas_exib[] = sprintf('%02d:00', $h);
-  // Junta com horários reais
-  $horas_todas = array_unique(array_merge($horas_exib, array_keys($por_hora)));
-  sort($horas_todas);
-
-  foreach ($horas_todas as $hora): ?>
-  <div class="grid border-b border-outline-variant/10 last:border-0" style="grid-template-columns:80px repeat(5,1fr)">
-    <!-- Hora -->
-    <div class="p-2 text-[10px] font-bold text-on-surface-variant text-center pt-3"><?= $hora ?></div>
-    <!-- Dias -->
-    <?php foreach ([1,2,3,4,5] as $d):
-      $slot = $por_hora[$hora][$d] ?? null;
+    <?php foreach ($dias_full as $didx=>$d):
+      // Conta conflitos nesse dia
+      $conf_dia = 0;
+      foreach ($todos_slots_raw as $sl) {
+          if ((int)$sl['dia_semana']===$didx && $sl['total_no_horario']>=3) $conf_dia++;
+      }
     ?>
-    <div class="cron-cell">
-      <?php if ($slot):
-        $vagas_ocu = (int)$slot['reservas_ativas'];
-        $vagas_tot = (int)$slot['vagas_total'];
-        $lotado = $vagas_ocu >= $vagas_tot;
-        $tipo = ($vagas_ocu > 0 && !$lotado) ? 'tipo-ciclo' : ($lotado ? 'tipo-plantao' : '');
-        $prac_arr = array_slice(array_filter(array_map('trim',explode(',',$slot['praticas']??''))),0,2);
-      ?>
-      <div class="cron-slot <?= $tipo ?: 'tipo-ciclo' ?>" onclick="abrirModal('modal-editar-slot'); preencherEditSlot(<?= htmlspecialchars(json_encode($slot),ENT_QUOTES) ?>)">
-        <div class="flex items-center justify-between mb-1">
-          <span class="font-bold text-[11px]"><?= substr($slot['hora_inicio'],0,5) ?>–<?= substr($slot['hora_fim'],0,5) ?></span>
-          <span class="text-[9px] font-bold px-1.5 py-0.5 rounded-full <?= $lotado?'bg-red-500/30':'bg-white/25' ?>">
-            <?= $lotado ? 'Lotado' : "{$vagas_ocu}/{$vagas_tot}" ?>
-          </span>
-        </div>
-        <?php foreach ($prac_arr as $pp): ?><span class="text-[9px] opacity-80"><?= htmlspecialchars($pp) ?></span><br><?php endforeach; ?>
-        <?php if (!empty($slot['pac_nomes'])): ?>
-        <div class="mt-1 pt-1 border-t border-white/20">
-          <?php foreach (array_slice($slot['pac_nomes'],0,2) as $pn): ?>
-          <p class="text-[9px] opacity-90 truncate">· <?= htmlspecialchars($pn) ?></p>
-          <?php endforeach; ?>
-        </div>
-        <?php endif; ?>
-      </div>
-      <?php else: ?>
-      <div class="cron-slot tipo-livre" onclick="preencherNovoSlot(<?= $d ?>, '<?= $hora ?>'); abrirModal('modal-novo-slot')">
-        <span class="text-[9px]">+ Adicionar</span>
-      </div>
+    <div class="p-3 text-center font-bold text-on-surface text-sm border-l border-outline-variant/20 <?= $conf_dia>0?'bg-red-50/50':'' ?>">
+      <?= $d ?>
+      <?php if ($conf_dia>0): ?>
+      <span class="block text-[9px] text-red-600 font-bold">⚠ conflito</span>
       <?php endif; ?>
     </div>
     <?php endforeach; ?>
   </div>
+
+  <?php foreach ($horas_todas as $hora): ?>
+  <div class="grid border-b border-outline-variant/10 last:border-0" style="grid-template-columns:72px repeat(5,1fr)">
+    <div class="p-2 text-[10px] font-bold text-on-surface-variant text-center pt-3"><?= $hora ?></div>
+
+    <?php foreach ([1,2,3,4,5] as $d):
+      $slots_celula = $por_hora_todos[$hora][$d] ?? [];
+      $meu_slot     = $meus_por_hora[$hora][$d]  ?? null;
+      $total_ter    = count($slots_celula); // quantos terapeutas nessa célula exata
+      // Conta sobreposições (qualquer slot que se sobreponha, não só mesma hora exata)
+      $max_sobrep = 0;
+      if (!empty($slots_celula)) {
+          $max_sobrep = max(array_column($slots_celula, 'total_no_horario'));
+      }
+      // Classe de maca
+      $maca_cls = $max_sobrep >= 3 ? 'maca-cheia' : ($max_sobrep == 2 ? 'maca-aviso' : ($max_sobrep == 1 ? 'maca-ok' : ''));
+      $maca_num = $max_sobrep;
+    ?>
+    <div class="cron-cell relative">
+
+      <?php if (empty($slots_celula)): ?>
+      <!-- Célula vazia — clicável para adicionar meu slot -->
+      <div class="cron-slot tipo-livre h-full min-h-[60px] flex flex-col items-center justify-center gap-1"
+           onclick="preencherNovoSlot(<?= $d ?>, '<?= $hora ?>'); abrirModal('modal-novo-slot')">
+        <span class="text-[9px]">+ Adicionar</span>
+        <?php if ($maca_num > 0): ?><span class="maca-badge <?= $maca_cls ?>"><?= $maca_num ?></span><?php endif; ?>
+      </div>
+
+      <?php else: ?>
+      <!-- Badge de maca no canto superior direito da célula -->
+      <?php if ($maca_num > 0): ?>
+      <span class="maca-badge <?= $maca_cls ?> absolute top-1 right-1 z-10" title="<?= $maca_num ?> terapeuta(s) neste horário"><?= $maca_num ?></span>
+      <?php endif; ?>
+
+      <?php foreach ($slots_celula as $sl):
+        $e_meu    = $sl['e_meu'];
+        $sobrep   = (int)$sl['total_no_horario'];
+        $conf_cls = $sobrep >= 3 ? 'conflito' : ($sobrep == 2 ? 'aviso' : '');
+        $base_cls = $e_meu ? 'meu-slot' : 'outro-slot';
+        $prac_arr = array_slice(array_filter(array_map('trim',explode(',',$sl['praticas']??''))),0,1);
+        $vagas_ocu= (int)$sl['reservas_ativas'];
+        $vagas_tot= (int)$sl['vagas_total'];
+      ?>
+      <?php
+        $data_slot    = htmlspecialchars(json_encode($sl), ENT_QUOTES);
+        $data_detalhe = htmlspecialchars(json_encode([
+          'ter'       => $sl['ter_nome'],
+          'hi'        => substr($sl['hora_inicio'],0,5),
+          'hf'        => substr($sl['hora_fim'],0,5),
+          'praticas'  => $sl['praticas'] ?? '',
+          'vagas_ocu' => $vagas_ocu,
+          'vagas_tot' => $vagas_tot,
+          'sobrep'    => $sobrep,
+          'nomes'     => $sl['nomes_sobrepostos'],
+        ]), ENT_QUOTES);
+      ?>
+      <div class="cron-slot <?= $base_cls ?> <?= $conf_cls ?>"
+           <?php if ($e_meu): ?>
+             onclick="abrirModal('modal-editar-slot'); preencherEditSlot(JSON.parse(this.dataset.sl))"
+             data-sl="<?= $data_slot ?>"
+           <?php else: ?>
+             onclick="abrirDetalheSlot(JSON.parse(this.dataset.det))"
+             data-det="<?= $data_detalhe ?>"
+           <?php endif; ?>>
+
+        <div class="flex items-center justify-between gap-1 mb-0.5">
+          <span class="font-bold text-[10px] leading-tight"><?= substr($sl['hora_inicio'],0,5) ?>–<?= substr($sl['hora_fim'],0,5) ?></span>
+          <?php if (!$e_meu): ?>
+          <span class="text-[8px] opacity-70 shrink-0"><?= $vagas_ocu ?>/<?= $vagas_tot ?></span>
+          <?php else: ?>
+          <span class="text-[8px] font-bold px-1 py-0.5 rounded <?= $vagas_ocu>=$vagas_tot?'bg-red-500/40':'bg-white/20' ?>">
+            <?= $vagas_ocu ?>/<?= $vagas_tot ?>
+          </span>
+          <?php endif; ?>
+        </div>
+
+        <!-- Nome do terapeuta (se não for meu) -->
+        <?php if (!$e_meu): ?>
+        <p class="text-[9px] font-bold truncate opacity-90"><?= htmlspecialchars(explode(' ',$sl['ter_nome'])[0]) ?></p>
+        <?php endif; ?>
+
+        <!-- Prática -->
+        <?php foreach ($prac_arr as $pp): ?>
+        <p class="text-[8px] opacity-70 truncate"><?= htmlspecialchars($pp) ?></p>
+        <?php endforeach; ?>
+
+        <!-- Pacientes (só no meu slot) -->
+        <?php if ($e_meu && !empty($sl['pac_nomes'])): ?>
+        <div class="mt-1 pt-1 border-t border-white/25">
+          <?php foreach (array_slice($sl['pac_nomes'],0,2) as $pn): ?>
+          <p class="text-[8px] opacity-90 truncate">· <?= htmlspecialchars($pn) ?></p>
+          <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- Aviso de conflito -->
+        <?php if ($conf_cls === 'conflito' && $e_meu): ?>
+        <div class="mt-1 flex items-center gap-0.5">
+          <span style="font-family:'Material Symbols Outlined';font-size:10px">warning</span>
+          <span class="text-[8px] font-bold">Sem maca!</span>
+        </div>
+        <?php elseif ($conf_cls === 'aviso' && $e_meu): ?>
+        <div class="mt-1 flex items-center gap-0.5 opacity-80">
+          <span style="font-family:'Material Symbols Outlined';font-size:9px">info</span>
+          <span class="text-[8px]">Macas cheias</span>
+        </div>
+        <?php endif; ?>
+      </div>
+      <?php endforeach; ?>
+      <?php endif; ?>
+
+    </div>
+    <?php endforeach; ?>
+  </div>
   <?php endforeach; ?>
+</div>
+
+<!-- Modal: Detalhe de slot de outro terapeuta -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-detalhe-slot">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-detalhe-slot')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-sm rounded-[2rem] shadow-2xl p-7">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-base font-extrabold text-primary">Horário de outro terapeuta</h2>
+      <button onclick="fecharModal('modal-detalhe-slot')" class="w-8 h-8 flex items-center justify-center rounded-full bg-surface-container-high"><span class="material-symbols-outlined text-sm text-on-surface-variant">close</span></button>
+    </div>
+    <div id="detalhe-slot-body" class="space-y-3 text-sm"></div>
+  </div>
 </div>
 
 <!-- Lista de todos os ciclos -->
@@ -861,14 +1053,33 @@ foreach ($todos_ciclos as &$tc) {
 <div class="max-w-2xl mx-auto">
   <h1 class="text-2xl font-extrabold text-primary mb-6">Meu perfil</h1>
   <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-5">
-    <!-- Avatar -->
+    <!-- Avatar com upload -->
     <div class="flex items-center gap-5">
-      <div class="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center">
-        <span class="material-symbols-outlined text-primary text-4xl">person</span>
+      <div class="avatar-upload" title="Clique para trocar a foto">
+        <?php $foto_url = !empty($perfil['foto']) ? '../'.htmlspecialchars($perfil['foto']).'?v='.time() : ''; ?>
+        <?php if ($foto_url): ?>
+          <img id="img-perfil-ter" src="<?= $foto_url ?>" alt="Foto" class="w-20 h-20" style="border-radius:9999px;object-fit:cover;"/>
+        <?php else: ?>
+          <div id="img-perfil-ter-placeholder" class="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center">
+            <span class="material-symbols-outlined text-primary text-4xl">person</span>
+          </div>
+        <?php endif; ?>
+        <div class="avatar-overlay">
+          <span class="material-symbols-outlined" style="font-size:22px">photo_camera</span>
+          <span style="font-size:10px;font-weight:700">Trocar foto</span>
+        </div>
+        <input type="file" accept="image/jpeg,image/png,image/webp"
+          onchange="uploadImagem(this,'perfil',{},function(url){
+            let img=document.getElementById('img-perfil-ter');
+            let ph=document.getElementById('img-perfil-ter-placeholder');
+            if(!img){img=document.createElement('img');img.id='img-perfil-ter';img.className='w-20 h-20';img.style.cssText='border-radius:9999px;object-fit:cover;';this.closest('.avatar-upload').prepend(img);if(ph)ph.remove();}
+            img.src=url;
+          }.bind(this))"/>
       </div>
       <div>
         <h2 class="text-xl font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2>
         <p class="text-sm text-on-surface-variant"><?= htmlspecialchars($perfil['especialidade']??'Terapeuta') ?> · <?= htmlspecialchars($perfil['periodo']??'') ?></p>
+        <p class="text-[10px] text-on-surface-variant mt-1 opacity-70">Clique na foto para alterar · máx. 2MB</p>
       </div>
     </div>
     <!-- Campos -->
@@ -1279,17 +1490,34 @@ async function excluirSlot() {
 
 // ── Plantão ───────────────────────────────────────────────────────────────────
 async function abrirPlantao() {
+  const hi = document.getElementById('plt-hi').value;
+  const hf = document.getElementById('plt-hf').value;
+  if (!hi || !hf) { toast('Informe os horários do plantão.','error','text-red-500'); return; }
+  if (hi >= hf)   { toast('A hora de fim deve ser depois do início.','error','text-red-500'); return; }
+  const btn = document.querySelector('#modal-plantao-novo button[onclick="abrirPlantao()"]');
+  if (btn) { btn.disabled=true; btn.textContent='Abrindo...'; }
   const prats = [...document.querySelectorAll('.plt-prat-check:checked')].map(c=>c.value).join(', ');
-  const res = await api('../api/agenda_action.php', {
-    acao:'abrir_plantao',
-    hora_inicio:   document.getElementById('plt-hi').value,
-    hora_fim:      document.getElementById('plt-hf').value,
-    local:         document.getElementById('plt-local').value,
-    max_pacientes: document.getElementById('plt-max').value,
-    praticas:      prats,
-  });
-  if (res.ok) { toast('Plantão aberto!','local_hospital','text-emerald-600'); fecharModal('modal-plantao-novo'); setTimeout(()=>location.reload(),1000); }
-  else toast(res.msg||'Erro.','error','text-red-500');
+  try {
+    const res = await api('../api/agenda_action.php', {
+      acao:'abrir_plantao',
+      hora_inicio:   hi,
+      hora_fim:      hf,
+      local:         document.getElementById('plt-local').value,
+      max_pacientes: document.getElementById('plt-max').value,
+      praticas:      prats,
+    });
+    if (res.ok) {
+      toast('Plantão aberto com sucesso!','local_hospital','text-emerald-600');
+      fecharModal('modal-plantao-novo');
+      setTimeout(()=>location.reload(), 900);
+    } else {
+      toast(res.msg||'Erro ao abrir plantão.','error','text-red-500');
+      if (btn) { btn.disabled=false; btn.textContent='Abrir plantão'; }
+    }
+  } catch(e) {
+    toast('Erro de conexão. Verifique o servidor.','error','text-red-500');
+    if (btn) { btn.disabled=false; btn.textContent='Abrir plantão'; }
+  }
 }
 
 async function registrarAtendimento() {
@@ -1335,10 +1563,12 @@ async function registrarAtendimento() {
 }
 
 async function encerrarPlantao(pid) {
-  if (!confirm('Encerrar o plantão de hoje?')) return;
-  const res = await api('../api/agenda_action.php', {acao:'encerrar_plantao', plantao_id:pid});
-  if (res.ok) { toast('Plantão encerrado.','stop_circle','text-indigo-600'); setTimeout(()=>location.reload(),900); }
-  else toast(res.msg||'Erro.','error','text-red-500');
+  if (!confirm('Encerrar o plantão de hoje? Esta ação não pode ser desfeita.')) return;
+  try {
+    const res = await api('../api/agenda_action.php', {acao:'encerrar_plantao', plantao_id:pid});
+    if (res.ok) { toast('Plantão encerrado.','stop_circle','text-indigo-600'); setTimeout(()=>location.reload(),900); }
+    else toast(res.msg||'Erro ao encerrar.','error','text-red-500');
+  } catch(e) { toast('Erro de conexão.','error','text-red-500'); }
 }
 
 // ── Reservas ──────────────────────────────────────────────────────────────────
@@ -1415,6 +1645,39 @@ function filtrarTerapeutas() {
   });
 }
 
+// ── Detalhe de slot de outro terapeuta ───────────────────────────────────────
+function abrirDetalheSlot(dados) {
+  const macaInfo = dados.sobrep >= 3
+    ? `<div class="flex items-center gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+         <span class="material-symbols-outlined text-red-500 text-base">warning</span>
+         <div><p class="text-xs font-bold text-red-800">Conflito de macas!</p>
+         <p class="text-xs text-red-700">${dados.sobrep} terapeutas neste horário — sem macas disponíveis.</p></div></div>`
+    : dados.sobrep == 2
+    ? `<div class="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+         <span class="material-symbols-outlined text-amber-500 text-base">info</span>
+         <div><p class="text-xs font-bold text-amber-800">Macas cheias</p>
+         <p class="text-xs text-amber-700">As 2 macas estão ocupadas neste horário. Converse com a coordenação se precisar de uma.</p></div></div>`
+    : '';
+
+  const sobrepostosHtml = dados.nomes && dados.nomes.length
+    ? `<div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-1">Terapeutas nesse horário</p>
+       <p class="text-sm font-medium text-on-surface">${dados.nomes.join(', ')}</p></div>` : '';
+
+  document.getElementById('detalhe-slot-body').innerHTML = `
+    ${macaInfo}
+    <div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-0.5">Terapeuta</p>
+    <p class="font-bold text-on-surface">${dados.ter}</p></div>
+    <div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-0.5">Horário</p>
+    <p class="text-on-surface">${dados.hi} – ${dados.hf}</p></div>
+    ${dados.praticas ? `<div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-0.5">Práticas</p>
+    <p class="text-on-surface">${dados.praticas}</p></div>` : ''}
+    <div><p class="text-[10px] font-bold uppercase text-on-surface-variant mb-0.5">Vagas</p>
+    <p class="text-on-surface">${dados.vagas_ocu} de ${dados.vagas_tot} ocupadas</p></div>
+    ${sobrepostosHtml}
+  `;
+  abrirModal('modal-detalhe-slot');
+}
+
 // ── Histórico do paciente ─────────────────────────────────────────────────────
 async function abrirHistPaciente(pacUid, pnome) {
   document.getElementById('hist-pac-titulo').textContent = 'Histórico — ' + pnome;
@@ -1438,5 +1701,6 @@ async function abrirHistPaciente(pacUid, pnome) {
   } catch { document.getElementById('hist-pac-body').innerHTML='<p class="text-sm text-error text-center py-8">Erro ao carregar.</p>'; }
 }
 </script>
+<?php include '../includes/upload_component.php'; ?>
 </body>
 </html>

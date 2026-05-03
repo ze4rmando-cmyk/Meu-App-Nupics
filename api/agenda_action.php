@@ -97,7 +97,7 @@ switch ($acao) {
 
     // ── Abrir plantão ──────────────────────────────────────────────────────────
     case 'abrir_plantao':
-        $data = trim($_POST['data'] ?? date('Y-m-d'));
+        $data = date('Y-m-d'); // sempre usa data do PHP para evitar divergência de timezone
         $hi   = trim($_POST['hora_inicio'] ?? '');
         $hf   = trim($_POST['hora_fim']    ?? '');
         $local= trim($_POST['local']       ?? '');
@@ -108,12 +108,19 @@ switch ($acao) {
             : trim($prat_raw);
 
         if (!$hi || !$hf) resp(false, 'Informe os horários do plantão.');
+        if ($hi >= $hf)   resp(false, 'A hora de fim deve ser depois da hora de início.');
+
+        // Verifica se já tem plantão aberto hoje
+        $chk = $pdo->prepare("SELECT id FROM plantoes WHERE terapeuta_id=? AND data=? AND status='aberto' LIMIT 1");
+        $chk->execute([$uid, $data]);
+        if ($chk->fetch()) resp(false, 'Você já tem um plantão aberto hoje. Encerre-o antes de abrir outro.');
 
         $pdo->prepare("INSERT INTO plantoes
-                (terapeuta_id, data, hora_inicio, hora_fim, local, max_pacientes, praticas)
-               VALUES (?,?,?,?,?,?,?)")
+                (terapeuta_id, data, hora_inicio, hora_fim, local, max_pacientes, praticas, status)
+               VALUES (?,?,?,?,?,?,?,'aberto')")
             ->execute([$uid, $data, $hi, $hf, $local, $max, $prat]);
-        resp(true, 'Plantão aberto!', ['plantao_id' => (int)$pdo->lastInsertId()]);
+        $pid = (int)$pdo->lastInsertId();
+        resp(true, 'Plantão aberto!', ['plantao_id' => $pid]);
 
     // ── Registrar atendimento no plantão ───────────────────────────────────────
     case 'registrar_plantao':
@@ -213,14 +220,15 @@ switch ($acao) {
 
     // ── Plantão aberto hoje ────────────────────────────────────────────────────
     case 'plantao_hoje':
+        $hoje_php = date('Y-m-d');
         $p = $pdo->prepare("
             SELECT p.*, COUNT(sp.id) AS total_atendidos
             FROM plantoes p
             LEFT JOIN sessoes_plantao sp ON sp.plantao_id = p.id
-            WHERE p.terapeuta_id=? AND p.data=CURDATE() AND p.status='aberto'
+            WHERE p.terapeuta_id=? AND p.data=? AND p.status='aberto'
             GROUP BY p.id ORDER BY p.hora_inicio LIMIT 1
         ");
-        $p->execute([$uid]);
+        $p->execute([$uid, $hoje_php]);
         $plt = $p->fetch(PDO::FETCH_ASSOC);
         if (!$plt) resp(false, 'Nenhum plantão aberto hoje.');
         $sp = $pdo->prepare("

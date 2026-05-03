@@ -1,7 +1,7 @@
 <?php
 session_start();
 if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'coordenador') {
-    header('Location: ../index.php'); exit;
+    header('Location: ../login.php'); exit;
 }
 require_once '../config/db.php';
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -753,6 +753,19 @@ foreach ($slots_gestao as $sl):
         <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">title</span></span><input type="text" id="msg-titulo" placeholder="Título do aviso"/></div></div>
       <div><label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Mensagem</label>
         <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">message</span></span><textarea id="msg-texto" rows="4" placeholder="Escreva aqui..."></textarea></div></div>
+      <!-- Imagem opcional -->
+      <div>
+        <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Imagem (opcional)</label>
+        <div class="upload-area" style="padding:12px">
+          <input type="file" id="aviso-img-input" accept="image/jpeg,image/png,image/webp"
+                 onchange="_avisoImgFile=this.files[0];
+                   document.getElementById('aviso-img-preview').src=URL.createObjectURL(this.files[0]);
+                   document.getElementById('aviso-img-preview').style.display='block'"/>
+          <img id="aviso-img-preview" style="max-height:100px;border-radius:8px;margin:0 auto 6px;display:none;"/>
+          <p class="text-xs text-on-surface-variant">Clique ou arraste · JPG, PNG · máx 2MB</p>
+        </div>
+        <div class="upload-progress" id="upload-bar-aviso"><div class="upload-progress-bar"></div></div>
+      </div>
       <button onclick="enviarAviso()" class="w-full py-3.5 rounded-full bg-gradient-to-r from-purple-700 to-pink-600 text-white font-bold text-sm hover:opacity-90 active:scale-95 transition-all flex items-center justify-center gap-2">
         <span class="material-symbols-outlined text-sm">send</span>Publicar aviso
       </button>
@@ -955,8 +968,32 @@ function gerarPDF(){
   <!-- Dados atuais -->
   <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-4">
     <div class="flex items-center gap-5 mb-2">
-      <div class="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center"><span class="material-symbols-outlined text-primary text-3xl">manage_accounts</span></div>
-      <div><h2 class="text-lg font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2><p class="text-xs text-on-surface-variant">Coordenador(a) NUPICS</p></div>
+      <div class="avatar-upload" title="Clique para trocar a foto">
+        <?php $foto_coord = !empty($perfil['foto']) ? '../'.htmlspecialchars($perfil['foto']).'?v='.time() : ''; ?>
+        <?php if ($foto_coord): ?>
+          <img id="img-perfil-coord" src="<?= $foto_coord ?>" alt="Foto" class="w-16 h-16" style="border-radius:9999px;object-fit:cover;"/>
+        <?php else: ?>
+          <div id="img-perfil-coord-ph" class="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
+            <span class="material-symbols-outlined text-primary text-3xl">manage_accounts</span>
+          </div>
+        <?php endif; ?>
+        <div class="avatar-overlay">
+          <span class="material-symbols-outlined" style="font-size:20px">photo_camera</span>
+          <span style="font-size:10px;font-weight:700">Trocar foto</span>
+        </div>
+        <input type="file" accept="image/jpeg,image/png,image/webp"
+          onchange="uploadImagem(this,'perfil',{},function(url){
+            let img=document.getElementById('img-perfil-coord');
+            let ph=document.getElementById('img-perfil-coord-ph');
+            if(!img){img=document.createElement('img');img.id='img-perfil-coord';img.className='w-16 h-16';img.style.cssText='border-radius:9999px;object-fit:cover;';this.closest('.avatar-upload').prepend(img);if(ph)ph.remove();}
+            img.src=url;
+          }.bind(this))"/>
+      </div>
+      <div>
+        <h2 class="text-lg font-extrabold text-primary"><?= htmlspecialchars($perfil['nome']) ?></h2>
+        <p class="text-xs text-on-surface-variant">Coordenador(a) NUPICS</p>
+        <p class="text-[10px] text-on-surface-variant mt-0.5 opacity-70">Clique na foto para alterar</p>
+      </div>
     </div>
     <?php foreach ([['E-mail','mail',$perfil['email']],['Telefone','phone',$perfil['telefone']??'Não informado'],['Membro desde','calendar_today',date('d/m/Y',strtotime($perfil['criado_em']))]] as [$l,$ic,$v]): ?>
     <div class="flex items-center gap-4 bg-surface-container-low/60 rounded-2xl px-5 py-3 border border-outline-variant/15">
@@ -1000,6 +1037,34 @@ function gerarPDF(){
     <button onclick="alterarSenha()" class="px-6 py-3 rounded-full bg-secondary text-white text-sm font-bold hover:opacity-90 active:scale-95 transition-all flex items-center gap-2">
       <span class="material-symbols-outlined text-sm">key</span>Alterar senha
     </button>
+  </div>
+
+  <!-- Logo do NUPICS -->
+  <div class="glass rounded-3xl p-7 border border-outline-variant/20 space-y-4">
+    <h3 class="font-headline font-bold text-on-surface flex items-center gap-2">
+      <span class="material-symbols-outlined text-primary text-lg">image</span>Logo do NUPICS
+    </h3>
+    <?php
+      $logo_path = $pdo->query("SELECT valor FROM configuracoes WHERE chave='logo_path' LIMIT 1")->fetchColumn();
+    ?>
+    <?php if ($logo_path): ?>
+    <img src="../<?= htmlspecialchars($logo_path) ?>?v=<?= time() ?>" alt="Logo NUPICS" class="max-h-24 rounded-xl border border-outline-variant/30"/>
+    <?php else: ?>
+    <p class="text-sm text-on-surface-variant">Nenhuma logo customizada definida.</p>
+    <?php endif; ?>
+    <div class="upload-area">
+      <input type="file" accept="image/jpeg,image/png,image/webp,image/gif"
+             onchange="uploadImagem(this,'logo',{},function(url){
+               let img=document.querySelector('.logo-preview-img');
+               if(!img){img=document.createElement('img');img.className='logo-preview-img max-h-24 rounded-xl border border-outline-variant/30';this.closest('.space-y-4').prepend(img);}
+               img.src=url;
+             }.bind(this))"/>
+      <span class="material-symbols-outlined text-on-surface-variant text-3xl mb-1">upload_file</span>
+      <p class="text-xs font-bold text-on-surface-variant">Clique ou arraste a logo aqui</p>
+      <p class="text-[10px] text-on-surface-variant opacity-70">JPG, PNG, WebP, GIF · máx 2MB</p>
+    </div>
+    <div class="upload-progress" id="upload-bar-logo"><div class="upload-progress-bar"></div></div>
+    <p class="text-xs text-on-surface-variant">A logo aparecerá no cabeçalho dos relatórios PDF.</p>
   </div>
 </div>
 <?php endif; ?>
@@ -1589,7 +1654,8 @@ async function salvarNovoTerapeuta(){
   if(d.ok){toast(d.msg,'person_add','text-emerald-600');fecharModal('modal-novo-terapeuta');setTimeout(()=>location.reload(),1200)}
   else toast(d.msg||'Erro.','error','text-red-500');
 }
-// Auto-refresh do painel a cada 60s
+// Variável global para imagem do aviso
+let _avisoImgFile = null;
 const _abaAtual = <?= json_encode($aba) ?>;
 if (_abaAtual === 'painel') setInterval(() => location.reload(), 60000);
 
@@ -1615,5 +1681,6 @@ async function abrirHistPac(pacUid,pnome){
   }catch{document.getElementById('hist-pac-body').innerHTML='<p class="text-sm text-error text-center py-8">Erro ao carregar.</p>'}
 }
 </script>
+<?php include '../includes/upload_component.php'; ?>
 </body>
 </html>

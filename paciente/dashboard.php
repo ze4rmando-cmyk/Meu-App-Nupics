@@ -1,7 +1,7 @@
 <?php
 session_start();
 if (!isset($_SESSION['usuario_id']) || $_SESSION['tipo'] !== 'paciente') {
-    header('Location: ../index.php'); exit;
+    header('Location: ../login.php'); exit;
 }
 require_once '../config/db.php';
 
@@ -193,9 +193,35 @@ $guias = [
   <!-- ── Cabeçalho ── -->
   <section class="grid grid-cols-1 md:grid-cols-12 gap-6 items-end">
     <div class="md:col-span-8 space-y-3">
-      <h1 class="text-4xl md:text-5xl font-extrabold text-primary tracking-tight">
-        Olá, <?= htmlspecialchars($primeiro) ?> 👋
-      </h1>
+      <div class="flex items-center gap-4 mb-2">
+        <?php
+          $stmt_foto = $pdo->prepare("SELECT foto FROM usuarios WHERE id=? LIMIT 1");
+          $stmt_foto->execute([$uid]);
+          $foto_pac = $stmt_foto->fetchColumn();
+        ?>
+        <div class="avatar-upload shrink-0" title="Clique para trocar sua foto">
+          <?php if ($foto_pac): ?>
+            <img id="img-pac-av" src="../<?= htmlspecialchars($foto_pac) ?>?v=<?= time() ?>" alt="Foto" class="w-14 h-14" style="border-radius:9999px;object-fit:cover;"/>
+          <?php else: ?>
+            <div id="img-pac-ph" class="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center text-2xl font-extrabold text-primary">
+              <?= mb_substr($primeiro, 0, 1) ?>
+            </div>
+          <?php endif; ?>
+          <div class="avatar-overlay">
+            <span class="material-symbols-outlined" style="font-size:18px">photo_camera</span>
+          </div>
+          <input type="file" accept="image/jpeg,image/png,image/webp"
+            onchange="uploadImagem(this,'perfil',{},function(url){
+              let img=document.getElementById('img-pac-av');
+              let ph=document.getElementById('img-pac-ph');
+              if(!img){img=document.createElement('img');img.id='img-pac-av';img.className='w-14 h-14';img.style.cssText='border-radius:9999px;object-fit:cover;';this.closest('.avatar-upload').prepend(img);if(ph)ph.remove();}
+              img.src=url;
+            }.bind(this))"/>
+        </div>
+        <h1 class="text-4xl md:text-5xl font-extrabold text-primary tracking-tight">
+          Olá, <?= htmlspecialchars($primeiro) ?> 👋
+        </h1>
+      </div>
       <p class="text-lg text-on-surface-variant max-w-xl">
         <?= htmlspecialchars(strip_tags($frase)) ?>
         <?php if ($frase_autor): ?><span class="text-sm text-outline"> — <?= htmlspecialchars($frase_autor) ?></span><?php endif; ?>
@@ -964,5 +990,6 @@ function toast(msg, icon='check_circle', cor='text-emerald-600') {
   t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),3000);
 }
 </script>
+<?php include '../includes/upload_component.php'; ?>
 </body>
 </html>
