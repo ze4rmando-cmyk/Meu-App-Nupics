@@ -122,7 +122,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 
     <!-- Logo -->
     <a href="#" class="flex items-center gap-2.5 no-underline">
-      <img src="uploads/logo/logo.png" alt="NUPICS" class="logo-img"/>
+      <img src="uploads/logo/lotus.png" alt="NUPICS" class="logo-img"/>
       <span class="text-xl font-extrabold bg-gradient-to-r from-purple-800 to-pink-600 bg-clip-text text-transparent" style="font-family:'Plus Jakarta Sans',sans-serif">NUPICS</span>
     </a>
 
@@ -188,7 +188,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 
         <!-- Stats -->
         <div class="hero-anim-4 flex gap-8 pt-2">
-          <?php foreach ([['Gratuito','100%'],['Práticas','8+'],['Atendimentos','Desde 2022']] as [$l,$v]): ?>
+          <?php foreach ([['Gratuito','100%'],['Práticas','10+'],['Atendimentos','Desde 2022']] as [$l,$v]): ?>
           <div>
             <p class="text-xl font-extrabold text-primary"><?= $v ?></p>
             <p class="text-xs text-on-surface-variant font-semibold uppercase tracking-wider"><?= $l ?></p>
@@ -204,7 +204,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
         <div class="absolute" style="width:340px;height:340px;border-radius:50%;background:linear-gradient(135deg,rgba(78,0,120,.04),rgba(183,0,77,.04));border:1px dashed rgba(78,0,120,.12)"></div>
 
         <!-- Logo central flutuando -->
-        <img src="uploads/logo/logo.png" alt="NUPICS" class="logo-img-hero relative z-10"/>
+        <img src="uploads/logo/flor.png" alt="NUPICS" class="logo-img-hero relative z-10"/>
 
         <!-- Cards de praticas orbitando -->
         <div class="absolute glass rounded-2xl px-4 py-3 flex items-center gap-2.5 shadow-lg" style="top:5%;left:5%;animation:float 4s 1s ease-in-out infinite">
@@ -213,7 +213,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
         </div>
         <div class="absolute glass rounded-2xl px-4 py-3 flex items-center gap-2.5 shadow-lg" style="top:10%;right:5%;animation:float 4s .5s ease-in-out infinite">
           <span class="material-symbols-outlined text-primary" style="font-size:20px">spa</span>
-          <span class="text-xs font-bold text-on-surface">Reiki</span>
+          <span class="text-xs font-bold text-on-surface">Massagem</span>
         </div>
         <div class="absolute glass rounded-2xl px-4 py-3 flex items-center gap-2.5 shadow-lg" style="bottom:15%;left:2%;animation:float 4s 2s ease-in-out infinite">
           <span class="material-symbols-outlined text-secondary" style="font-size:20px">healing</span>
@@ -233,7 +233,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
 <section id="sobre" class="py-28 px-6 md:px-10 max-w-7xl mx-auto">
   <div class="text-center mb-16 reveal">
     <span class="tag mb-4" style="background:#f4d9ff;color:#6a1b9a">
-      <img src="uploads/logo/logo.png" alt="" style="height:16px;width:16px;object-fit:contain"/>
+      <img src="uploads/logo/lotus.png" alt="" style="height:16px;width:16px;object-fit:contain"/>
       O que é o NUPICS
     </span>
     <h2 class="text-4xl font-extrabold text-on-surface mt-3">Um santuário de bem-estar</h2>
@@ -451,7 +451,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
       <div class="absolute -top-20 -right-20 opacity-10" style="width:300px;height:300px;border-radius:50%;border:60px solid #fff"></div>
       <div class="absolute -bottom-16 -left-16 opacity-10" style="width:250px;height:250px;border-radius:50%;border:50px solid #fff"></div>
       <div class="absolute top-8 right-8 opacity-20">
-        <img src="uploads/logo/logo.png" alt="" style="height:80px;width:80px;object-fit:contain;filter:brightness(0) invert(1)"/>
+        <img src="uploads/logo/flor.png" alt="" style="height:80px;width:80px;object-fit:contain;filter:brightness(0) invert(1)"/>
       </div>
 
       <div class="relative z-10 flex flex-col md:flex-row items-center gap-12">
@@ -483,7 +483,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
   <div class="orb" style="width:400px;height:400px;background:#b7004d;opacity:.2;bottom:-20%;left:-5%"></div>
 
   <div class="max-w-7xl mx-auto px-6 md:px-10 relative z-10 text-center reveal">
-    <img src="uploads/logo/logo.png" alt="NUPICS" class="mx-auto mb-8" style="height:72px;width:72px;object-fit:contain;filter:brightness(0) invert(1) opacity(.6)"/>
+    <img src="uploads/logo/flor.png" alt="NUPICS" class="mx-auto mb-8" style="height:72px;width:72px;object-fit:contain;filter:brightness(0) invert(1) opacity(.6)"/>
     <h2 class="text-5xl md:text-6xl font-extrabold mb-6 leading-tight" style="color:#fff">
       Pronto para cuidar de você?
     </h2>
@@ -508,7 +508,7 @@ body::before{content:'';position:fixed;inset:0;background-image:url("data:image/
   <div class="max-w-7xl mx-auto px-6 md:px-10 py-14 flex flex-col md:flex-row justify-between items-center gap-8">
     <div class="flex flex-col items-center md:items-start gap-3">
       <div class="flex items-center gap-2">
-        <img src="uploads/logo/logo.png" alt="NUPICS" style="height:24px;width:24px;object-fit:contain"/>
+        <img src="uploads/logo/lotus.png" alt="NUPICS" style="height:24px;width:24px;object-fit:contain"/>
         <span class="font-extrabold text-on-surface" style="font-family:'Plus Jakarta Sans',sans-serif">NUPICS</span>
       </div>
       <p class="text-sm text-on-surface-variant text-center md:text-left max-w-xs">
