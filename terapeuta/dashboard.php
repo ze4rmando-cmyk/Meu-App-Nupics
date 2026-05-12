@@ -329,6 +329,9 @@ $stats_gerais = $pdo->query("SELECT
           <span class="material-symbols-outlined text-primary text-base">person</span>
         </div>
         <span class="hidden md:block text-sm font-semibold text-on-surface"><?= htmlspecialchars($pri) ?></span>
+        <a href="../api/trocar_senha.php" class="text-xs font-semibold text-on-surface-variant hover:text-primary transition-colors flex items-center gap-0.5">
+          <span class="material-symbols-outlined" style="font-size:14px">key</span>Senha
+        </a>
         <a href="../logout.php" class="text-xs font-semibold text-on-surface-variant hover:text-secondary transition-colors">Sair</a>
       </div>
     </div>

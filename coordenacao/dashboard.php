@@ -831,6 +831,114 @@ foreach ($slots_gestao as $sl):
   </div>
 </div>
 
+<?php
+// Frases de apoio
+$frases_todas = $pdo->query("SELECT * FROM frases ORDER BY tipo, ativo DESC, id DESC")->fetchAll(PDO::FETCH_ASSOC);
+$frases_pac   = array_filter($frases_todas, fn($f)=>$f['tipo']==='paciente');
+$frases_ter   = array_filter($frases_todas, fn($f)=>$f['tipo']==='terapeuta');
+?>
+<div class="mb-8">
+  <div class="flex items-center justify-between mb-5">
+    <h2 class="text-xl font-extrabold text-primary flex items-center gap-2">
+      <span class="material-symbols-outlined text-secondary">format_quote</span>
+      Frases de apoio
+    </h2>
+    <button onclick="abrirModal('modal-nova-frase')" class="flex items-center gap-1.5 px-4 py-2 rounded-full bg-primary text-white text-xs font-bold hover:opacity-90 active:scale-95 transition-all">
+      <span class="material-symbols-outlined text-sm">add</span>Nova frase
+    </button>
+  </div>
+
+  <?php foreach ([['paciente','Pacientes','person'],['terapeuta','Terapeutas','medical_services']] as [$tipo_f,$label_f,$ic_f]): ?>
+  <div class="mb-6">
+    <p class="text-xs font-bold uppercase tracking-widest text-on-surface-variant mb-3 flex items-center gap-1.5">
+      <span class="material-symbols-outlined text-sm"><?= $ic_f ?></span><?= $label_f ?>
+      <span class="text-[10px] bg-primary/8 text-primary px-2 py-0.5 rounded-full">
+        <?= count(array_filter($frases_todas, fn($f)=>$f['tipo']===$tipo_f && $f['ativo'])) ?> ativas
+      </span>
+    </p>
+    <div class="space-y-2">
+      <?php foreach (array_filter($frases_todas, fn($f)=>$f['tipo']===$tipo_f) as $fr): ?>
+      <div class="glass rounded-2xl px-5 py-3.5 border border-outline-variant/20 flex items-start gap-3 <?= $fr['ativo']?'':'opacity-50' ?>">
+        <span class="material-symbols-outlined text-secondary shrink-0 mt-0.5" style="font-size:18px">format_quote</span>
+        <div class="flex-1 min-w-0">
+          <p class="text-sm text-on-surface leading-relaxed"><?= htmlspecialchars($fr['texto']) ?></p>
+          <?php if ($fr['autor']): ?>
+          <p class="text-xs text-on-surface-variant mt-0.5">— <?= htmlspecialchars($fr['autor']) ?></p>
+          <?php endif; ?>
+        </div>
+        <div class="flex gap-1.5 shrink-0">
+          <button onclick="editarFrase(<?= htmlspecialchars(json_encode($fr)) ?>)"
+                  class="text-[10px] font-bold px-2.5 py-1 rounded-full border border-outline-variant/40 text-primary hover:bg-primary/5">Editar</button>
+          <button onclick="toggleFrase(<?= $fr['id'] ?>,<?= $fr['ativo']?0:1 ?>,this)"
+                  class="text-[10px] font-bold px-2.5 py-1 rounded-full <?= $fr['ativo']?'bg-red-50 text-red-600 hover:bg-red-100':'bg-emerald-50 text-emerald-700 hover:bg-emerald-100' ?>">
+            <?= $fr['ativo']?'Desativar':'Ativar' ?></button>
+          <button onclick="excluirFrase(<?= $fr['id'] ?>,this)"
+                  class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-50 text-red-600 hover:bg-red-100">✕</button>
+        </div>
+      </div>
+      <?php endforeach; ?>
+      <?php if (empty(array_filter($frases_todas, fn($f)=>$f['tipo']===$tipo_f))): ?>
+      <p class="text-sm text-on-surface-variant py-4 text-center">Nenhuma frase cadastrada para <?= $label_f ?>.</p>
+      <?php endif; ?>
+    </div>
+  </div>
+  <?php endforeach; ?>
+</div>
+
+<!-- Modal: Nova frase -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-nova-frase">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-nova-frase')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-7 space-y-4">
+    <h2 class="text-lg font-extrabold text-primary">Nova frase de apoio</h2>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Destinatário</label>
+      <div class="flex gap-2">
+        <label class="pill-opt flex-1 text-center"><input type="radio" name="nf-tipo" value="paciente" checked>👤 Pacientes</label>
+        <label class="pill-opt flex-1 text-center"><input type="radio" name="nf-tipo" value="terapeuta">🩺 Terapeutas</label>
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Texto da frase *</label>
+      <div class="campo campo-rect" style="border-radius:14px">
+        <span class="ic"><span class="material-symbols-outlined" style="font-size:18px">format_quote</span></span>
+        <textarea id="nf-texto" rows="3" placeholder="Digite a frase de apoio..." class="flex-1 border-none bg-transparent p-3 text-sm outline-none resize-none font-body"></textarea>
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Autor (opcional)</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">person</span></span><input type="text" id="nf-autor" placeholder="Ex: Dalai Lama, Anônimo..."/></div>
+    </div>
+    <div class="flex gap-3">
+      <button onclick="salvarFrase()" class="flex-1 py-3 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90">Salvar frase</button>
+      <button onclick="fecharModal('modal-nova-frase')" class="px-5 py-3 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm">Cancelar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Editar frase -->
+<div class="modal-wrap fixed inset-0 z-[100] items-center justify-center p-4" id="modal-editar-frase">
+  <div class="absolute inset-0 bg-primary/20 backdrop-blur-sm" onclick="fecharModal('modal-editar-frase')"></div>
+  <div class="glass modal-card relative z-10 w-full max-w-md rounded-[2rem] shadow-2xl p-7 space-y-4">
+    <h2 class="text-lg font-extrabold text-primary">Editar frase</h2>
+    <input type="hidden" id="ef-id"/>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Texto da frase *</label>
+      <div class="campo campo-rect" style="border-radius:14px">
+        <span class="ic"><span class="material-symbols-outlined" style="font-size:18px">format_quote</span></span>
+        <textarea id="ef-texto" rows="3" class="flex-1 border-none bg-transparent p-3 text-sm outline-none resize-none font-body"></textarea>
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs font-bold uppercase text-on-surface/60 mb-1.5">Autor (opcional)</label>
+      <div class="campo"><span class="ic"><span class="material-symbols-outlined" style="font-size:18px">person</span></span><input type="text" id="ef-autor" placeholder="Autor ou Anônimo"/></div>
+    </div>
+    <div class="flex gap-3">
+      <button onclick="salvarEdicaoFrase()" class="flex-1 py-3 rounded-full bg-primary text-white font-bold text-sm hover:opacity-90">Salvar</button>
+      <button onclick="fecharModal('modal-editar-frase')" class="px-5 py-3 rounded-full border-2 border-outline-variant text-on-surface-variant font-bold text-sm">Cancelar</button>
+    </div>
+  </div>
+</div>
+
 <?php elseif ($aba === 'visitas'): ?>
 <div class="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
   <div><h1 class="text-2xl font-extrabold text-primary">Visitas externas</h1><p class="text-sm text-on-surface-variant"><?= count($visitas_lista) ?> visita(s)</p></div>
@@ -1545,6 +1653,45 @@ async function salvarNovaVisita(e){
 }
 
 // Histórico paciente
+// ── Frases de apoio ─────────────────────────────────────────────────────────
+async function salvarFrase(){
+  const tipo  = document.querySelector('input[name="nf-tipo"]:checked').value;
+  const texto = document.getElementById('nf-texto').value.trim();
+  const autor = document.getElementById('nf-autor').value.trim();
+  if(!texto){toast('Digite o texto da frase.','error','text-red-500');return}
+  const d=await api('../api/frases_action.php',{acao:'criar',tipo,texto,autor});
+  if(d.ok){toast(d.msg,'check_circle','text-emerald-600');fecharModal('modal-nova-frase');setTimeout(()=>location.reload(),900)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+function editarFrase(fr){
+  document.getElementById('ef-id').value=fr.id;
+  document.getElementById('ef-texto').value=fr.texto;
+  document.getElementById('ef-autor').value=fr.autor||'';
+  abrirModal('modal-editar-frase');
+}
+async function salvarEdicaoFrase(){
+  const id    = document.getElementById('ef-id').value;
+  const texto = document.getElementById('ef-texto').value.trim();
+  const autor = document.getElementById('ef-autor').value.trim();
+  if(!texto){toast('Digite o texto da frase.','error','text-red-500');return}
+  const d=await api('../api/frases_action.php',{acao:'editar',id,texto,autor});
+  if(d.ok){toast(d.msg,'check_circle','text-emerald-600');fecharModal('modal-editar-frase');setTimeout(()=>location.reload(),900)}
+  else toast(d.msg||'Erro.','error','text-red-500');
+}
+async function toggleFrase(id,ativo,btn){
+  btn.disabled=true;
+  const d=await api('../api/frases_action.php',{acao:'toggle',id,ativo});
+  if(d.ok){toast(d.msg,'check_circle','text-emerald-600');setTimeout(()=>location.reload(),800)}
+  else{toast(d.msg||'Erro.','error','text-red-500');btn.disabled=false}
+}
+async function excluirFrase(id,btn){
+  if(!confirm('Excluir esta frase permanentemente?'))return;
+  btn.disabled=true;
+  const d=await api('../api/frases_action.php',{acao:'excluir',id});
+  if(d.ok){toast('Frase excluída.','delete','text-red-500');setTimeout(()=>location.reload(),800)}
+  else{toast(d.msg||'Erro.','error','text-red-500');btn.disabled=false}
+}
+
 // Perfil
 async function salvarPerfil(){
   const nome=document.getElementById('perf-nome').value.trim();

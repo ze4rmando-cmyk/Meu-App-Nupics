@@ -176,6 +176,9 @@ $guias = [
     <div class="hidden md:flex items-center gap-8 font-['Plus_Jakarta_Sans'] font-medium text-sm">
       <span class="text-primary border-b-2 border-primary pb-0.5">Início</span>
       <a href="agendar.php" class="text-on-surface-variant hover:text-primary transition-colors">Agendar Sessão</a>
+      <a href="../api/trocar_senha.php" class="text-on-surface-variant hover:text-primary transition-colors font-semibold flex items-center gap-1">
+        <span class="material-symbols-outlined" style="font-size:16px">key</span>Senha
+      </a>
       <a href="../logout.php" class="text-on-surface-variant hover:text-secondary transition-colors font-semibold">Sair</a>
     </div>
     <button id="mob-btn" class="md:hidden text-primary">
